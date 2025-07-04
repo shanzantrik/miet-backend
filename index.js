@@ -555,6 +555,11 @@ app.delete('/api/services/:id/consultants/:consultantId', authenticateToken, req
   res.json({ success: true });
 });
 
+// Default root endpoint to show server is running
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', message: 'Server is running' });
+});
+
 // --- Start server ---
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
