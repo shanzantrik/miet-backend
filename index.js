@@ -7,10 +7,12 @@ import cors from 'cors';
 import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
+import bodyParser from 'body-parser';
 
 const app = express();
 app.use(express.json());
 app.use(cors());
+app.use(bodyParser.json());
 
 const JWT_SECRET = 'your_jwt_secret'; // Change this in production
 const INIT_DB = process.argv.includes('--initdb');
@@ -169,6 +171,16 @@ async function setupDatabase() {
   // Ensure all users have status
   await db.exec("UPDATE users SET status = 'active' WHERE status IS NULL");
 
+  // --- MIGRATION: Add name and email columns to users if missing ---
+  if (!userCols.some(col => col.name === 'name')) {
+    await db.exec("ALTER TABLE users ADD COLUMN name TEXT");
+    console.log('Migrated: Added name column to users table.');
+  }
+  if (!userCols.some(col => col.name === 'email')) {
+    await db.exec("ALTER TABLE users ADD COLUMN email TEXT");
+    console.log('Migrated: Added email column to users table.');
+  }
+
   // --- MIGRATION: Add new service fields if missing ---
   const serviceCols = await db.all("PRAGMA table_info(services)");
   const addCol = async (col, type) => {
@@ -307,7 +319,7 @@ app.post('/api/consultants', authenticateToken, requireRole('superadmin'), async
   const user_id = userResult.lastID;
   // Create consultant profile
   const result = await db.run(
-    `INSERT INTO consultants (user_id, name, email, phone, image, description, tagline, location_lat, location_lng, address, speciality, id_proof_type, id_proof_url, aadhar, bank_account, bank_ifsc, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO consultants (user_id, name, email, phone, image, description, tagline, location_lat, location_lng, address, speciality, id_proof_type, id_proof_url, aadhar, bank_account, bank_ifsc, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     user_id, name, email, phone, image, description, tagline, location_lat, location_lng, address, speciality, id_proof_type, id_proof_url, aadhar, bank_account, bank_ifsc, status || 'offline'
   );
   res.json({ id: result.lastID, user_id });
@@ -598,4 +610,32 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   // Return the public URL to the uploaded file
   const fileUrl = `/uploads/${req.file.filename}`;
   res.json({ url: fileUrl });
+});
+
+app.post('/submit-form', (req, res) => {
+  console.log('Received /submit-form:', req.body);
+  const { name, email } = req.body;
+  if (!name || !email) {
+    return res.status(400).json({ success: false, message: 'Name and email required.' });
+  }
+  db.run(
+    'INSERT INTO users (name, email) VALUES (?, ?)',
+    [name, email],
+    function (err) {
+      if (err) {
+        console.error('DB error:', err);
+        return res.status(500).json({ success: false, message: 'Database error.' });
+      }
+      console.log('User added with ID:', this.lastID);
+      // Log all users after insert
+      db.all('SELECT id, name, email FROM users', [], (err, rows) => {
+        if (err) {
+          console.error('Error fetching users:', err);
+        } else {
+          console.log('Current users:', rows);
+        }
+      });
+      res.json({ success: true, message: 'User added!', userId: this.lastID });
+    }
+  );
 });
