@@ -150,15 +150,31 @@ async function setupDatabase() {
   const admin = await db.get('SELECT * FROM admin WHERE username = ?', 'admin');
   if (!admin) {
     const hash = await bcrypt.hash('admin123', 10);
-    await db.run('INSERT INTO admin (username, password) VALUES (?, ?)', 'admin', hash);
-    console.log('Seeded default admin: admin/admin123');
+    try {
+      await db.run('INSERT INTO admin (username, password) VALUES (?, ?)', 'admin', hash);
+      console.log('Seeded default admin: admin/admin123');
+    } catch (err) {
+      if (err.code === 'SQLITE_CONSTRAINT') {
+        console.log('Admin user already exists, skipping insert.');
+      } else {
+        throw err;
+      }
+    }
   }
   // Seed superadmin user in users table if not exists
   const superadminUser = await db.get('SELECT * FROM users WHERE username = ?', 'admin');
   if (!superadminUser) {
     const hash = await bcrypt.hash('admin123', 10);
-    await db.run('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', 'admin', hash, 'superadmin');
-    console.log('Seeded superadmin user: admin/admin123');
+    try {
+      await db.run('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', 'admin', hash, 'superadmin');
+      console.log('Seeded superadmin user: admin/admin123');
+    } catch (err) {
+      if (err.code === 'SQLITE_CONSTRAINT') {
+        console.log('Superadmin user already exists, skipping insert.');
+      } else {
+        throw err;
+      }
+    }
   }
 
   // --- MIGRATION: Add status column to users if missing ---
@@ -201,6 +217,19 @@ async function setupDatabase() {
   await addCol('event_end', 'TEXT');
   await addCol('event_image', 'TEXT');
   await addCol('event_meet_link', 'TEXT');
+
+  // --- MIGRATION: Add city column to consultants if missing ---
+  const consultantCols = await db.all("PRAGMA table_info(consultants)");
+  if (!consultantCols.some(col => col.name === 'city')) {
+    await db.exec("ALTER TABLE consultants ADD COLUMN city TEXT");
+    console.log('Migrated: Added city column to consultants table.');
+  }
+  
+  // --- MIGRATION: Add featured column to consultants if missing ---
+  if (!consultantCols.some(col => col.name === 'featured')) {
+    await db.exec("ALTER TABLE consultants ADD COLUMN featured INTEGER DEFAULT 0");
+    console.log('Migrated: Added featured column to consultants table.');
+  }
 }
 
 (async () => {
@@ -294,10 +323,76 @@ function requireRole(role) {
 }
 
 // --- Consultant CRUD API ---
-// Get all consultants (superadmin only)
+// Get all consultants (superadmin only) with optional city filter
 app.get('/api/consultants', authenticateToken, requireRole('superadmin'), async (req, res) => {
-  const consultants = await db.all('SELECT * FROM consultants');
-  res.json(consultants);
+  const { city } = req.query;
+  let sql = 'SELECT * FROM consultants';
+  let params = [];
+  if (city) {
+    sql += ' WHERE city = ?';
+    params.push(city);
+  }
+  try {
+    const consultants = await db.all(sql, params);
+    res.json(consultants);
+  } catch (err) {
+    console.error('Database error:', err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Public: Get all consultants (no auth required)
+app.get('/api/consultants/public', async (req, res) => {
+  const consultants = await db.all('SELECT DISTINCT * FROM consultants ORDER BY id');
+  // Ensure city and location are valid for each consultant
+  const result = consultants.map(c => {
+    const city = (typeof c.city === 'string' && c.city.trim() !== '') ? c.city : 'Unknown';
+    let location = 'Unknown';
+    if (
+      c.location_lat !== null && c.location_lat !== undefined && c.location_lat !== '' &&
+      c.location_lng !== null && c.location_lng !== undefined && c.location_lng !== ''
+    ) {
+      location = `${c.location_lat},${c.location_lng}`;
+    }
+    // Convert featured from integer to boolean
+    const featured = c.featured === 1;
+    // Remove location_lat and location_lng from the response
+    const { location_lat, location_lng, featured: featuredInt, ...rest } = c;
+    return {
+      ...rest,
+      city,
+      location,
+      featured
+    };
+  });
+  res.json(result);
+});
+
+// Public: Get featured consultants only (no auth required)
+app.get('/api/consultants/featured', async (req, res) => {
+  const consultants = await db.all('SELECT DISTINCT * FROM consultants WHERE featured = 1 ORDER BY id');
+  // Ensure city and location are valid for each consultant
+  const result = consultants.map(c => {
+    const city = (typeof c.city === 'string' && c.city.trim() !== '') ? c.city : 'Unknown';
+    let location = 'Unknown';
+    if (
+      c.location_lat !== null && c.location_lat !== undefined && c.location_lat !== '' &&
+      c.location_lng !== null && c.location_lng !== undefined && c.location_lng !== ''
+    ) {
+      location = `${c.location_lat},${c.location_lng}`;
+    }
+    // Convert featured from integer to boolean
+    const featured = c.featured === 1;
+    // Remove location_lat and location_lng from the response
+    const { location_lat, location_lng, featured: featuredInt, ...rest } = c;
+    return {
+      ...rest,
+      city,
+      location,
+      featured
+    };
+  });
+  res.json(result);
 });
 // Get consultant by id (superadmin or self)
 app.get('/api/consultants/:id', authenticateToken, async (req, res) => {
@@ -311,18 +406,38 @@ app.get('/api/consultants/:id', authenticateToken, async (req, res) => {
 });
 // Create consultant (superadmin only)
 app.post('/api/consultants', authenticateToken, requireRole('superadmin'), async (req, res) => {
-  const { username, password, name, email, phone, image, description, tagline, location_lat, location_lng, address, speciality, id_proof_type, id_proof_url, aadhar, bank_account, bank_ifsc, status } = req.body;
-  if (!username || !password || !name || !email) return res.status(400).json({ error: 'Missing required fields' });
-  // Create user
-  const hash = await bcrypt.hash(password, 10);
-  const userResult = await db.run('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', username, hash, 'consultant');
-  const user_id = userResult.lastID;
-  // Create consultant profile
-  const result = await db.run(
-    `INSERT INTO consultants (user_id, name, email, phone, image, description, tagline, location_lat, location_lng, address, speciality, id_proof_type, id_proof_url, aadhar, bank_account, bank_ifsc, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    user_id, name, email, phone, image, description, tagline, location_lat, location_lng, address, speciality, id_proof_type, id_proof_url, aadhar, bank_account, bank_ifsc, status || 'offline'
-  );
-  res.json({ id: result.lastID, user_id });
+  const { username, password, name, email, phone, image, description, tagline, location_lat, location_lng, address, speciality, id_proof_type, id_proof_url, aadhar, bank_account, bank_ifsc, status, city, featured } = req.body;
+  if (!username || !password || !name || !email || !city || city.trim() === '') return res.status(400).json({ error: 'Missing required fields (city is required)' });
+  try {
+    // Create user
+    const hash = await bcrypt.hash(password, 10);
+    const userResult = await db.run('INSERT INTO users (username, password, role) VALUES (?, ?, ?)', username, hash, 'consultant');
+    const user_id = userResult.lastID;
+    // Ensure image path is correct
+    let imagePath = image;
+    if (imagePath && !imagePath.startsWith('/uploads/')) {
+      imagePath = '/uploads/' + imagePath.replace(/^\\+|^\/+/,'');
+    }
+    // Create consultant profile
+    const result = await db.run(
+      `INSERT INTO consultants (user_id, name, email, phone, image, description, tagline, location_lat, location_lng, address, speciality, id_proof_type, id_proof_url, aadhar, bank_account, bank_ifsc, status, city, featured) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      user_id, name, email, phone, imagePath, description, tagline, location_lat, location_lng, address, speciality, id_proof_type, id_proof_url, aadhar, bank_account, bank_ifsc, status || 'offline', city, featured ? 1 : 0
+    );
+    res.json({ id: result.lastID, user_id });
+  } catch (err) {
+    if (err.code === 'SQLITE_CONSTRAINT') {
+      // Check if the error is for username or email
+      if (err.message.includes('users.username')) {
+        return res.status(400).json({ error: 'Username already exists. Please choose a different username.' });
+      }
+      if (err.message.includes('consultants.email')) {
+        return res.status(400).json({ error: 'Email already exists. Please use a different email.' });
+      }
+      // Generic constraint error
+      return res.status(400).json({ error: 'A unique constraint failed. Please check your input.' });
+    }
+    throw err;
+  }
 });
 // Update consultant (superadmin or self)
 app.put('/api/consultants/:id', authenticateToken, async (req, res) => {
@@ -334,16 +449,23 @@ app.put('/api/consultants/:id', authenticateToken, async (req, res) => {
   }
   // Only update allowed fields
   const fields = [
-    'name', 'email', 'phone', 'image', 'description', 'tagline', 'location_lat', 'location_lng', 'address', 'speciality', 'id_proof_type', 'id_proof_url', 'aadhar', 'bank_account', 'bank_ifsc', 'status'
+    'name', 'email', 'phone', 'image', 'description', 'tagline', 'location_lat', 'location_lng', 'address', 'speciality', 'id_proof_type', 'id_proof_url', 'aadhar', 'bank_account', 'bank_ifsc', 'status', 'city', 'featured'
   ];
   const updates = [];
   const values = [];
   for (const field of fields) {
     if (req.body[field] !== undefined) {
       updates.push(`${field} = ?`);
-      values.push(req.body[field]);
+      // Handle featured field as boolean to integer conversion
+      if (field === 'featured') {
+        values.push(req.body[field] ? 1 : 0);
+      } else {
+        values.push(req.body[field]);
+      }
     }
   }
+  // Require city for update as well
+  if (!req.body.city || req.body.city.trim() === '') return res.status(400).json({ error: 'City is required' });
   if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
   values.push(id);
   await db.run(`UPDATE consultants SET ${updates.join(', ')} WHERE id = ?`, ...values);
@@ -366,6 +488,17 @@ app.post('/api/consultants/:id/status', authenticateToken, async (req, res) => {
   }
   if (!['online', 'offline'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
   await db.run('UPDATE consultants SET status = ? WHERE id = ?', status, id);
+  res.json({ success: true });
+});
+
+// Toggle consultant featured status (superadmin only)
+app.post('/api/consultants/:id/featured', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  const { id } = req.params;
+  const { featured } = req.body;
+  const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', id);
+  if (!consultant) return res.status(404).json({ error: 'Not found' });
+  if (typeof featured !== 'boolean') return res.status(400).json({ error: 'Featured must be a boolean' });
+  await db.run('UPDATE consultants SET featured = ? WHERE id = ?', featured ? 1 : 0, id);
   res.json({ success: true });
 });
 // Consultant availability CRUD (consultant or superadmin)
@@ -456,7 +589,7 @@ app.get('/api/services/:id', authenticateToken, requireRole('superadmin'), async
   const service = await db.get('SELECT * FROM services WHERE id = ?', id);
   if (!service) return res.status(404).json({ error: 'Not found' });
   // Get consultants
-  const consultants = await db.all('SELECT c.* FROM consultants c JOIN services_consultants sc ON c.id = sc.consultant_id WHERE sc.service_id = ?', id);
+  const consultants = await db.all('SELECT DISTINCT c.* FROM consultants c JOIN services_consultants sc ON c.id = sc.consultant_id WHERE sc.service_id = ? ORDER BY c.id', id);
   // Get categories
   const categories = await db.all('SELECT ac.* FROM ailments_category ac JOIN service_ailment_categories sac ON ac.id = sac.category_id WHERE sac.service_id = ?', id);
   // Get subcategories
@@ -551,7 +684,7 @@ app.delete('/api/services/:id', authenticateToken, requireRole('superadmin'), as
 // Manage consultants for a service
 app.get('/api/services/:id/consultants', authenticateToken, requireRole('superadmin'), async (req, res) => {
   const { id } = req.params;
-  const consultants = await db.all('SELECT c.* FROM consultants c JOIN services_consultants sc ON c.id = sc.consultant_id WHERE sc.service_id = ?', id);
+  const consultants = await db.all('SELECT DISTINCT c.* FROM consultants c JOIN services_consultants sc ON c.id = sc.consultant_id WHERE sc.service_id = ? ORDER BY c.id', id);
   res.json(consultants);
 });
 app.post('/api/services/:id/consultants', authenticateToken, requireRole('superadmin'), async (req, res) => {
@@ -638,4 +771,146 @@ app.post('/submit-form', (req, res) => {
       res.json({ success: true, message: 'User added!', userId: this.lastID });
     }
   );
+});
+
+// --- Consultant Public API ---
+// Get all consultants (public, no auth)
+app.get('/api/consultants/public', async (req, res) => {
+  const consultants = await db.all('SELECT * FROM consultants');
+  res.json(consultants);
+});
+
+// --- Dynamic Products API with File Uploads ---
+
+// Ensure products table exists with all required fields
+async function ensureProductsTableV2() {
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS products (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      title TEXT,
+      name TEXT,
+      description TEXT,
+      price REAL,
+      author TEXT,
+      video_url TEXT,
+      download_link TEXT,
+      purchase_link TEXT,
+      pdf_file TEXT,
+      image TEXT,
+      status TEXT CHECK(status IN ('active', 'inactive')) NOT NULL DEFAULT 'active',
+      featured INTEGER DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+}
+
+// Multer setup for product uploads
+const productUploadsDir = path.join(process.cwd(), 'uploads', 'products');
+if (!fs.existsSync(productUploadsDir)) {
+  fs.mkdirSync(productUploadsDir, { recursive: true });
+}
+const productStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, productUploadsDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    let safeName = file.originalname
+      .toLowerCase()
+      .normalize('NFKD')
+      .replace(/\s+/g, '_')
+      .replace(/[^a-z0-9._-]/g, '_');
+    cb(null, uniqueSuffix + '-' + safeName);
+  }
+});
+const productUpload = multer({ storage: productStorage });
+
+// Serve product uploads statically
+app.use('/uploads/products', express.static(productUploadsDir));
+
+// POST /api/products - create a new product with dynamic fields and file uploads
+app.post('/api/products', productUpload.fields([
+  { name: 'image', maxCount: 1 },
+  { name: 'thumbnail', maxCount: 1 },
+  { name: 'icon', maxCount: 1 },
+  { name: 'pdf_file', maxCount: 1 }
+]), async (req, res) => {
+  await ensureProductsTableV2();
+  const data = req.body;
+  const files = req.files || {};
+
+  // Dynamic field mapping based on type
+  const type = data.type;
+  let title = data.title || null;
+  let name = data.name || null;
+  let description = data.description || null;
+  let price = data.price ? parseFloat(data.price) : null;
+  let author = data.author || null;
+  let video_url = data.video_url || null;
+  let download_link = data.download_link || null;
+  let purchase_link = data.purchase_link || null;
+  let status = data.status || 'active';
+  let featured = data.featured === 'true' || data.featured === '1' ? 1 : 0;
+
+  // File fields
+  let image = null;
+  let pdf_file = null;
+
+  // Map file fields based on type
+  if (type === 'course') {
+    image = files.thumbnail ? '/uploads/products/' + files.thumbnail[0].filename : null;
+    title = data.title;
+  } else if (type === 'ebook') {
+    image = files.image ? '/uploads/products/' + files.image[0].filename : null;
+    pdf_file = files.pdf_file ? '/uploads/products/' + files.pdf_file[0].filename : null;
+    title = data.title;
+  } else if (type === 'app') {
+    image = files.icon ? '/uploads/products/' + files.icon[0].filename : null;
+    name = data.name;
+  } else if (type === 'gadget') {
+    image = files.image ? '/uploads/products/' + files.image[0].filename : null;
+    name = data.name;
+  } else {
+    // fallback: use any image field
+    image = files.image ? '/uploads/products/' + files.image[0].filename : null;
+  }
+  if (!type || (!title && !name)) {
+    return res.status(400).json({ error: 'Type and title/name are required.' });
+  }
+  try {
+    const result = await db.run(
+      `INSERT INTO products (type, title, name, description, price, author, video_url, download_link, purchase_link, pdf_file, image, status, featured) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      type, title, name, description, price, author, video_url, download_link, purchase_link, pdf_file, image, status, featured
+    );
+    res.json({
+      id: result.lastID,
+      type, title, name, description, price, author, video_url, download_link, purchase_link, pdf_file, image, status, featured
+    });
+  } catch (err) {
+    console.error('Error inserting product:', err);
+    res.status(500).json({ error: 'Database error.' });
+  }
+});
+
+// GET /api/products - fetch all products
+app.get('/api/products', async (req, res) => {
+  await ensureProductsTableV2();
+  try {
+    const products = await db.all('SELECT * FROM products ORDER BY created_at DESC');
+    res.json(products);
+  } catch (err) {
+    console.error('Error fetching products:', err);
+    res.status(500).json({ error: 'Database error.' });
+  }
+});
+
+// --- Catch-all 404 and error handler for JSON responses ---
+app.use((req, res, next) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
