@@ -230,6 +230,47 @@ async function setupDatabase() {
     await db.exec("ALTER TABLE consultants ADD COLUMN featured INTEGER DEFAULT 0");
     console.log('Migrated: Added featured column to consultants table.');
   }
+  
+  // --- MIGRATION: Update products table schema if needed ---
+  try {
+    const productsCols = await db.all("PRAGMA table_info(products)");
+    if (productsCols.length > 0) {
+      // Check if we need to migrate from old schema
+      const hasOldType = productsCols.some(col => col.name === 'type');
+      const hasNewProductType = productsCols.some(col => col.name === 'product_type');
+      
+      if (hasOldType && !hasNewProductType) {
+        // Migrate old 'type' column to 'product_type'
+        await db.exec("ALTER TABLE products RENAME COLUMN type TO product_type");
+        console.log('Migrated: Renamed type column to product_type in products table.');
+      }
+      
+      // Add new columns if they don't exist
+      const addCol = async (col, type) => {
+        if (!productsCols.some(c => c.name === col)) {
+          await db.exec(`ALTER TABLE products ADD COLUMN ${col} ${type}`);
+          console.log(`Migrated: Added ${col} column to products table.`);
+        }
+      };
+      
+      await addCol('thumbnail', 'TEXT');
+      await addCol('product_image', 'TEXT');
+      await addCol('icon', 'TEXT');
+      await addCol('video_url', 'TEXT');
+      await addCol('author', 'TEXT');
+      await addCol('pdf_file', 'TEXT');
+      await addCol('purchase_link', 'TEXT');
+      await addCol('download_link', 'TEXT');
+      
+      // If the table exists but doesn't have product_type, add it
+      if (!hasNewProductType && !hasOldType) {
+        await db.exec("ALTER TABLE products ADD COLUMN product_type TEXT");
+        console.log('Migrated: Added product_type column to products table.');
+      }
+    }
+  } catch (err) {
+    console.log('Products table migration check skipped (table may not exist yet).');
+  }
 }
 
 (async () => {
@@ -705,17 +746,38 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', message: 'Server is running' });
 });
 
+// Test endpoint for frontend connection
+app.get('/api/test', (req, res) => {
+  console.log('Test endpoint called');
+  res.json({ 
+    status: 'ok', 
+    message: 'Backend API is working',
+    timestamp: new Date().toISOString(),
+    products_count: 0 // We'll update this dynamically
+  });
+});
+
 // --- Start server ---
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`Backend API running on http://localhost:${PORT}`);
 });
 
-// Ensure uploads directory exists
+// Ensure uploads directory exists and create organized subdirectories
 const uploadsDir = path.join(process.cwd(), 'uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir);
-}
+const thumbnailsDir = path.join(uploadsDir, 'thumbnails');
+const pdfsDir = path.join(uploadsDir, 'pdfs');
+const iconsDir = path.join(uploadsDir, 'icons');
+const productImagesDir = path.join(uploadsDir, 'product_images');
+const instructorsDir = path.join(uploadsDir, 'instructors');
+const coursesDir = path.join(uploadsDir, 'courses');
+
+// Create directories if they don't exist
+[uploadsDir, thumbnailsDir, pdfsDir, iconsDir, productImagesDir, instructorsDir, coursesDir].forEach(dir => {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+});
 // Multer setup
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
@@ -735,7 +797,13 @@ const storage = multer.diskStorage({
   }
 });
 const upload = multer({ storage });
-// Serve uploads statically
+// Serve uploads statically with organized directories
+app.use('/uploads/thumbnails', express.static(thumbnailsDir));
+app.use('/uploads/pdfs', express.static(pdfsDir));
+app.use('/uploads/icons', express.static(iconsDir));
+app.use('/uploads/product_images', express.static(productImagesDir));
+app.use('/uploads/instructors', express.static(instructorsDir));
+app.use('/uploads/courses', express.static(coursesDir));
 app.use('/uploads', express.static(uploadsDir));
 // File upload endpoint
 app.post('/api/upload', upload.single('file'), (req, res) => {
@@ -780,39 +848,355 @@ app.get('/api/consultants/public', async (req, res) => {
   res.json(consultants);
 });
 
-// --- Dynamic Products API with File Uploads ---
+// --- Products API with File Uploads ---
+// 
+// POST /api/products - Create a new product
+// - Content-Type: multipart/form-data
+// - Supports 4 product types: course, ebook, app, gadget
+// - File uploads: thumbnail, pdf_file, icon, product_image
+// - Validation: Required fields based on product type
+// - File size limit: 10MB
+// - Response: { success: true, message: "Product created successfully", product: {...} }
+//
 
-// Ensure products table exists with all required fields
+// Ensure products table exists with all required fields including course-specific fields
 async function ensureProductsTableV2() {
+  try {
+    // Check if products table exists and has the right structure
+    const tableExists = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='products'");
+    
+    if (tableExists) {
+      // Table exists, check if it has the right columns
+      const columns = await db.all("PRAGMA table_info(products)");
+      const columnNames = columns.map(col => col.name);
+      
+      // Check if we have all required columns including new course fields
+      const requiredColumns = [
+        'product_type', 'title', 'name', 'description', 'price', 'video_url', 
+        'thumbnail', 'author', 'pdf_file', 'product_image', 'purchase_link', 
+        'download_link', 'icon', 'status', 'featured', 'created_at',
+        // New course-specific fields
+        'subtitle', 'instructor_name', 'instructor_title', 'instructor_bio',
+        'instructor_image', 'duration', 'total_lectures', 'language', 'level',
+        'rating', 'total_ratings', 'enrolled_students'
+      ];
+      
+      const missingColumns = requiredColumns.filter(col => !columnNames.includes(col));
+      
+      if (missingColumns.length > 0) {
+        console.log('Products table missing columns:', missingColumns);
+        console.log('Adding missing columns to products table...');
+        
+        // Add missing columns one by one
+        for (const col of missingColumns) {
+          let columnType = 'TEXT';
+          if (col === 'total_lectures' || col === 'total_ratings' || col === 'enrolled_students') {
+            columnType = 'INTEGER DEFAULT 0';
+          } else if (col === 'rating') {
+            columnType = 'REAL DEFAULT 0.00';
+          } else if (col === 'level') {
+            columnType = 'TEXT DEFAULT "Beginner"';
+          }
+          
+          try {
+            await db.exec(`ALTER TABLE products ADD COLUMN ${col} ${columnType}`);
+            console.log(`Added column: ${col}`);
+          } catch (err) {
+            if (err.message.includes('duplicate column name')) {
+              console.log(`Column ${col} already exists`);
+            } else {
+              console.error(`Error adding column ${col}:`, err);
+            }
+          }
+        }
+        console.log('Products table updated with new course fields');
+      } else {
+        console.log('Products table already has all required columns');
+      }
+    } else {
+      // Table doesn't exist, create it with all fields
   await db.exec(`
-    CREATE TABLE IF NOT EXISTS products (
+        CREATE TABLE products (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      type TEXT NOT NULL,
+          product_type TEXT NOT NULL,
       title TEXT,
       name TEXT,
       description TEXT,
       price REAL,
-      author TEXT,
       video_url TEXT,
-      download_link TEXT,
-      purchase_link TEXT,
+          thumbnail TEXT,
+          author TEXT,
       pdf_file TEXT,
-      image TEXT,
+          product_image TEXT,
+          purchase_link TEXT,
+          download_link TEXT,
+          icon TEXT,
       status TEXT CHECK(status IN ('active', 'inactive')) NOT NULL DEFAULT 'active',
       featured INTEGER DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          -- Course-specific fields
+          subtitle TEXT,
+          instructor_name TEXT,
+          instructor_title TEXT,
+          instructor_bio TEXT,
+          instructor_image TEXT,
+          duration TEXT,
+          total_lectures INTEGER DEFAULT 0,
+          language TEXT,
+          level TEXT DEFAULT 'Beginner',
+          rating REAL DEFAULT 0.00,
+          total_ratings INTEGER DEFAULT 0,
+          enrolled_students INTEGER DEFAULT 0
     );
   `);
+      console.log('Products table created with complete schema including course fields');
+    }
+    
+    // Create course-related tables
+    await ensureCourseTables();
+    
+  } catch (error) {
+    console.error('Error ensuring products table:', error);
+    throw error;
+  }
 }
 
-// Multer setup for product uploads
-const productUploadsDir = path.join(process.cwd(), 'uploads', 'products');
-if (!fs.existsSync(productUploadsDir)) {
-  fs.mkdirSync(productUploadsDir, { recursive: true });
+// Ensure course-related tables exist
+async function ensureCourseTables() {
+  try {
+    // Learning Objectives Table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS learning_objectives (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        objective TEXT NOT NULL,
+        order_index INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Requirements Table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS requirements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        requirement TEXT NOT NULL,
+        order_index INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Course Sections Table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS course_sections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        section_name TEXT NOT NULL,
+        lectures_count INTEGER DEFAULT 0,
+        duration TEXT,
+        order_index INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Course Lectures Table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS course_lectures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        section_id INTEGER NOT NULL,
+        lecture_title TEXT NOT NULL,
+        order_index INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(section_id) REFERENCES course_sections(id) ON DELETE CASCADE
+      );
+    `);
+    
+    console.log('Course-related tables ensured');
+  } catch (error) {
+    console.error('Error ensuring course tables:', error);
+    throw error;
+  }
 }
+
+// Helper functions for course management
+async function createLearningObjectives(productId, objectives) {
+  try {
+    if (!Array.isArray(objectives) || objectives.length === 0) return;
+    
+    for (let i = 0; i < objectives.length; i++) {
+      const objective = objectives[i];
+      if (objective && objective.trim()) {
+        await db.run(
+          'INSERT INTO learning_objectives (product_id, objective, order_index) VALUES (?, ?, ?)',
+          productId, objective.trim(), i
+        );
+      }
+    }
+  } catch (error) {
+    console.error('Error creating learning objectives:', error);
+    throw error;
+  }
+}
+
+async function createRequirements(productId, requirements) {
+  try {
+    if (!Array.isArray(requirements) || requirements.length === 0) return;
+    
+    for (let i = 0; i < requirements.length; i++) {
+      const requirement = requirements[i];
+      if (requirement && requirement.trim()) {
+        await db.run(
+          'INSERT INTO requirements (product_id, requirement, order_index) VALUES (?, ?, ?)',
+          productId, requirement.trim(), i
+        );
+      }
+    }
+  } catch (error) {
+    console.error('Error creating requirements:', error);
+    throw error;
+  }
+}
+
+async function createCourseContent(productId, content) {
+  try {
+    if (!Array.isArray(content) || content.length === 0) return;
+    
+    for (let i = 0; i < content.length; i++) {
+      const section = content[i];
+      if (section && section.section_name && section.lectures) {
+        // Create section
+        const sectionResult = await db.run(
+          'INSERT INTO course_sections (product_id, section_name, lectures_count, duration, order_index) VALUES (?, ?, ?, ?, ?)',
+          productId, section.section_name, section.lectures.length, section.duration || '', i
+        );
+        
+        const sectionId = sectionResult.lastID;
+        
+        // Create lectures for this section
+        for (let j = 0; j < section.lectures.length; j++) {
+          const lecture = section.lectures[j];
+          if (lecture && lecture.lecture_title) {
+            await db.run(
+              'INSERT INTO course_lectures (section_id, lecture_title, order_index) VALUES (?, ?, ?)',
+              sectionId, lecture.lecture_title, j
+            );
+          }
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error creating course content:', error);
+    throw error;
+  }
+}
+
+async function getLearningObjectives(productId) {
+  try {
+    return await db.all(
+      'SELECT * FROM learning_objectives WHERE product_id = ? ORDER BY order_index ASC',
+      productId
+    );
+  } catch (error) {
+    console.error('Error getting learning objectives:', error);
+    return [];
+  }
+}
+
+async function getRequirements(productId) {
+  try {
+    return await db.all(
+      'SELECT * FROM requirements WHERE product_id = ? ORDER BY order_index ASC',
+      productId
+    );
+  } catch (error) {
+    console.error('Error getting requirements:', error);
+    return [];
+  }
+}
+
+async function getCourseContent(productId) {
+  try {
+    const sections = await db.all(
+      'SELECT * FROM course_sections WHERE product_id = ? ORDER BY order_index ASC',
+      productId
+    );
+    
+    const content = [];
+    for (const section of sections) {
+      const lectures = await db.all(
+        'SELECT * FROM course_lectures WHERE section_id = ? ORDER BY order_index ASC',
+        section.id
+      );
+      content.push({
+        ...section,
+        lectures: lectures
+      });
+    }
+    
+    return content;
+  } catch (error) {
+    console.error('Error getting course content:', error);
+    return [];
+  }
+}
+
+async function deleteLearningObjectives(productId) {
+  try {
+    await db.run('DELETE FROM learning_objectives WHERE product_id = ?', productId);
+  } catch (error) {
+    console.error('Error deleting learning objectives:', error);
+    throw error;
+  }
+}
+
+async function deleteRequirements(productId) {
+  try {
+    await db.run('DELETE FROM requirements WHERE product_id = ?', productId);
+  } catch (error) {
+    console.error('Error deleting requirements:', error);
+    throw error;
+  }
+}
+
+async function deleteCourseContent(productId) {
+  try {
+    // Get all sections for this product
+    const sections = await db.all('SELECT id FROM course_sections WHERE product_id = ?', productId);
+    
+    // Delete lectures for each section
+    for (const section of sections) {
+      await db.run('DELETE FROM course_lectures WHERE section_id = ?', section.id);
+    }
+    
+    // Delete sections
+    await db.run('DELETE FROM course_sections WHERE product_id = ?', productId);
+  } catch (error) {
+    console.error('Error deleting course content:', error);
+    throw error;
+  }
+}
+
+// Product-specific multer setup using existing directories
+
 const productStorage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, productUploadsDir);
+    // Route files to appropriate directories based on field name
+    if (file.fieldname === 'thumbnail') {
+      cb(null, coursesDir); // Course thumbnails go to courses directory
+    } else if (file.fieldname === 'pdf_file') {
+      cb(null, pdfsDir);
+    } else if (file.fieldname === 'icon') {
+      cb(null, iconsDir);
+    } else if (file.fieldname === 'product_image') {
+      cb(null, productImagesDir);
+    } else if (file.fieldname === 'instructor_image') {
+      cb(null, instructorsDir);
+    } else {
+      cb(null, uploadsDir);
+    }
   },
   filename: function (req, file, cb) {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
@@ -824,84 +1208,540 @@ const productStorage = multer.diskStorage({
     cb(null, uniqueSuffix + '-' + safeName);
   }
 });
-const productUpload = multer({ storage: productStorage });
 
-// Serve product uploads statically
-app.use('/uploads/products', express.static(productUploadsDir));
+// File filter for validation
+const fileFilter = (req, file, cb) => {
+  if (file.fieldname === 'pdf_file') {
+    // Only allow PDFs for pdf_file field
+    if (file.mimetype === 'application/pdf') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are allowed for pdf_file field'), false);
+    }
+  } else {
+    // Allow images for other fields
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed for image fields'), false);
+    }
+  }
+};
+
+const productUpload = multer({ 
+  storage: productStorage,
+  fileFilter: fileFilter,
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB limit
+  }
+});
+
+
 
 // POST /api/products - create a new product with dynamic fields and file uploads
 app.post('/api/products', productUpload.fields([
-  { name: 'image', maxCount: 1 },
   { name: 'thumbnail', maxCount: 1 },
+  { name: 'product_image', maxCount: 1 },
   { name: 'icon', maxCount: 1 },
-  { name: 'pdf_file', maxCount: 1 }
-]), async (req, res) => {
+  { name: 'pdf_file', maxCount: 1 },
+  { name: 'instructor_image', maxCount: 1 }
+]), (err, req, res, next) => {
+  // Handle multer errors
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({
+        success: false,
+        message: 'File size too large. Maximum size is 10MB.'
+      });
+    }
+    return res.status(400).json({
+      success: false,
+      message: `File upload error: ${err.message}`
+    });
+  } else if (err) {
+    return res.status(400).json({
+      success: false,
+      message: err.message
+    });
+  }
+  next();
+}, async (req, res) => {
   await ensureProductsTableV2();
   const data = req.body;
   const files = req.files || {};
 
-  // Dynamic field mapping based on type
-  const type = data.type;
-  let title = data.title || null;
-  let name = data.name || null;
-  let description = data.description || null;
-  let price = data.price ? parseFloat(data.price) : null;
-  let author = data.author || null;
-  let video_url = data.video_url || null;
-  let download_link = data.download_link || null;
-  let purchase_link = data.purchase_link || null;
-  let status = data.status || 'active';
-  let featured = data.featured === 'true' || data.featured === '1' ? 1 : 0;
+  // Debug logging for files
+  console.log('Received files:', Object.keys(files));
+  console.log('Files details:', files);
 
-  // File fields
-  let image = null;
-  let pdf_file = null;
-
-  // Map file fields based on type
-  if (type === 'course') {
-    image = files.thumbnail ? '/uploads/products/' + files.thumbnail[0].filename : null;
-    title = data.title;
-  } else if (type === 'ebook') {
-    image = files.image ? '/uploads/products/' + files.image[0].filename : null;
-    pdf_file = files.pdf_file ? '/uploads/products/' + files.pdf_file[0].filename : null;
-    title = data.title;
-  } else if (type === 'app') {
-    image = files.icon ? '/uploads/products/' + files.icon[0].filename : null;
-    name = data.name;
-  } else if (type === 'gadget') {
-    image = files.image ? '/uploads/products/' + files.image[0].filename : null;
-    name = data.name;
-  } else {
-    // fallback: use any image field
-    image = files.image ? '/uploads/products/' + files.image[0].filename : null;
+  // Get product type and validate required fields
+  // Support multiple possible field names for product type
+  let productType = data.productType || data.product_type || data.type || data.productType;
+  
+  // Clean and normalize the product type
+  if (productType) {
+    productType = productType.toString().toLowerCase().trim();
   }
-  if (!type || (!title && !name)) {
-    return res.status(400).json({ error: 'Type and title/name are required.' });
-  }
-  try {
-    const result = await db.run(
-      `INSERT INTO products (type, title, name, description, price, author, video_url, download_link, purchase_link, pdf_file, image, status, featured) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      type, title, name, description, price, author, video_url, download_link, purchase_link, pdf_file, image, status, featured
-    );
-    res.json({
-      id: result.lastID,
-      type, title, name, description, price, author, video_url, download_link, purchase_link, pdf_file, image, status, featured
+  
+  // Debug logging
+  console.log('Received form data:', Object.keys(data));
+  console.log('Product type received (raw):', data.productType || data.product_type || data.type);
+  console.log('Product type received (cleaned):', productType);
+  console.log('All form fields:', data);
+  
+  if (!productType) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Product type is required. Please send either "productType", "product_type", or "type" field.',
+      receivedFields: Object.keys(data),
+      example: {
+        productType: 'course',
+        title: 'Course Title',
+        description: 'Course Description'
+      }
     });
+  }
+
+  // Validate required fields based on product type
+  let validationError = null;
+  let requiredFields = [];
+
+  // Normalize product type for flexible matching
+  const normalizedType = productType.replace(/[^a-z]/g, ''); // Remove all non-letters
+  
+  if (normalizedType === 'course') {
+    // Basic required fields
+    if (!data.title || !data.description || !files.thumbnail) {
+      validationError = 'Course requires: title, description, and thumbnail';
+    }
+    
+    // Validate title length (3-255 characters)
+    if (data.title && (data.title.length < 3 || data.title.length > 255)) {
+      validationError = 'Title must be between 3 and 255 characters';
+    }
+    
+    // Validate subtitle length (10-500 characters)
+    if (data.subtitle && (data.subtitle.length < 10 || data.subtitle.length > 500)) {
+      validationError = 'Subtitle must be between 10 and 500 characters';
+    }
+    
+    // Validate description length (minimum 20 characters)
+    if (data.description && data.description.length < 20) {
+      validationError = 'Description must be at least 20 characters long';
+    }
+    
+    // Validate price (optional, but if provided must be valid)
+    if (data.price && data.price !== 'Free' && isNaN(parseFloat(data.price))) {
+      validationError = 'Price must be "Free" or a valid number';
+    }
+    
+    // Validate learning objectives (optional for now, max 20 items)
+    if (data.learning_objectives && (!Array.isArray(data.learning_objectives) || data.learning_objectives.length > 20)) {
+      validationError = 'Learning objectives must be an array with maximum 20 items';
+    }
+    
+    // Validate requirements (optional, max 20 items)
+    if (data.requirements && (!Array.isArray(data.requirements) || data.requirements.length > 20)) {
+      validationError = 'Requirements must be an array with maximum 20 items';
+    }
+    
+    // Validate course content (optional, max 50 sections)
+    if (data.course_content && (!Array.isArray(data.course_content) || data.course_content.length > 50)) {
+      validationError = 'Course content must be an array with maximum 50 sections';
+    }
+  } else if (normalizedType === 'ebook') {
+    requiredFields = ['title', 'description', 'author', 'pdf_file', 'thumbnail'];
+    if (!data.title || !data.description || !data.author || !files.pdf_file || !files.thumbnail) {
+      validationError = 'E-Book requires: title, description, author, pdf_file, and thumbnail';
+    }
+  } else if (normalizedType === 'app') {
+    requiredFields = ['name', 'description', 'download_link', 'icon'];
+    if (!data.name || !data.description || !data.download_link || !files.icon) {
+      validationError = 'App requires: name, description, download_link, and icon';
+    }
+  } else if (normalizedType === 'gadget') {
+    requiredFields = ['name', 'description', 'price', 'product_image', 'purchase_link', 'download_link', 'icon'];
+    if (!data.name || !data.description || !data.price || !files.product_image || !data.purchase_link || !data.download_link || !files.icon) {
+      validationError = 'Gadget requires: name, description, price, product_image, purchase_link, download_link, and icon';
+    }
+    // Validate price is numeric
+    if (data.price && isNaN(parseFloat(data.price))) {
+      validationError = 'Price must be a valid number';
+    }
+  } else {
+    return res.status(400).json({ 
+      success: false, 
+      message: `Invalid product type: "${productType}". Must be one of: course, e-book/ebook, app, or gadget. Received: "${productType}" (normalized: "${normalizedType}")` 
+    });
+  }
+
+  if (validationError) {
+    return res.status(400).json({ 
+      success: false, 
+      message: validationError 
+    });
+  }
+
+  try {
+    // Prepare data for insertion
+    const title = data.title || null;
+    const name = data.name || null;
+    const description = data.description || null;
+    const price = data.price === 'Free' ? null : (data.price ? parseFloat(data.price) : null);
+    const video_url = data.video_url || null;
+    const author = data.author || null;
+    const purchase_link = data.purchase_link || null;
+    const download_link = data.download_link || null;
+    const status = data.status || 'active';
+    const featured = data.featured === 'true' || data.featured === '1' ? 1 : 0;
+    
+    // Course-specific fields
+    const subtitle = data.subtitle || null;
+    const instructor_name = data.instructor_name || null;
+    const instructor_title = data.instructor_title || null;
+    const instructor_bio = data.instructor_bio || null;
+    const instructor_image = files.instructor_image ? '/uploads/instructors/' + files.instructor_image[0].filename : null;
+    const duration = data.duration || null;
+    const total_lectures = data.total_lectures ? parseInt(data.total_lectures) : 0;
+    const language = data.language || null;
+    const level = data.level || 'Beginner';
+    const rating = data.rating ? parseFloat(data.rating) : 0.00;
+    const total_ratings = data.total_ratings ? parseInt(data.total_ratings) : 0;
+    const enrolled_students = data.enrolled_students ? parseInt(data.enrolled_students) : 0;
+
+    // Handle file uploads with organized directory structure
+    const thumbnail = files.thumbnail ? '/uploads/courses/' + files.thumbnail[0].filename : null;
+    const product_image = files.product_image ? '/uploads/product_images/' + files.product_image[0].filename : null;
+    const icon = files.icon ? '/uploads/icons/' + files.icon[0].filename : null;
+    const pdf_file = files.pdf_file ? '/uploads/pdfs/' + files.pdf_file[0].filename : null;
+
+    // Insert into database
+    const result = await db.run(
+      `INSERT INTO products (product_type, title, name, description, price, video_url, thumbnail, author, pdf_file, product_image, purchase_link, download_link, icon, status, featured, subtitle, instructor_name, instructor_title, instructor_bio, instructor_image, duration, total_lectures, language, level, rating, total_ratings, enrolled_students) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      productType, title, name, description, price, video_url, thumbnail, author, pdf_file, product_image, purchase_link, download_link, icon, status, featured, subtitle, instructor_name, instructor_title, instructor_bio, instructor_image, duration, total_lectures, language, level, rating, total_ratings, enrolled_students
+    );
+
+    const productId = result.lastID;
+    
+    // If this is a course, create related data
+    if (normalizedType === 'course') {
+      try {
+        // Create learning objectives
+        if (data.learning_objectives && Array.isArray(data.learning_objectives)) {
+          await createLearningObjectives(productId, data.learning_objectives);
+        }
+        
+        // Create requirements
+        if (data.requirements && Array.isArray(data.requirements)) {
+          await createRequirements(productId, data.requirements);
+        }
+        
+        // Create course content structure
+        if (data.course_content && Array.isArray(data.course_content)) {
+          await createCourseContent(productId, data.course_content);
+        }
+        
+        console.log('Course-related data created successfully');
+      } catch (error) {
+        console.error('Error creating course-related data:', error);
+        // Continue with response even if course data creation fails
+      }
+    }
+    
+    // Get the created product for response
+    const createdProduct = await db.get('SELECT * FROM products WHERE id = ?', productId);
+    
+    res.status(200).json({
+      success: true,
+      message: "Product created successfully",
+      product: createdProduct
+    });
+
   } catch (err) {
     console.error('Error inserting product:', err);
-    res.status(500).json({ error: 'Database error.' });
+    res.status(500).json({ 
+      success: false, 
+      message: 'Database error occurred while creating product' 
+    });
   }
 });
 
-// GET /api/products - fetch all products
+// GET /api/products - fetch all products with optional filtering
 app.get('/api/products', async (req, res) => {
+  console.log('Products endpoint called with query:', req.query);
   await ensureProductsTableV2();
   try {
-    const products = await db.all('SELECT * FROM products ORDER BY created_at DESC');
-    res.json(products);
+    const { type, status, featured } = req.query;
+    
+    let sql = 'SELECT * FROM products WHERE 1=1';
+    const params = [];
+    
+    // Filter by product type (case-insensitive)
+    if (type) {
+      sql += ' AND LOWER(product_type) = LOWER(?)';
+      params.push(type);
+    }
+    
+    // Filter by status
+    if (status) {
+      sql += ' AND status = ?';
+      params.push(status);
+    }
+    
+    // Filter by featured
+    if (featured !== undefined) {
+      sql += ' AND featured = ?';
+      params.push(featured === 'true' ? 1 : 0);
+    }
+    
+    sql += ' ORDER BY created_at DESC';
+    
+    console.log('Executing SQL:', sql, 'with params:', params);
+    
+    const products = await db.all(sql, params);
+    console.log(`Found ${products.length} products`);
+    
+    res.json({
+      success: true,
+      products: products
+    });
   } catch (err) {
     console.error('Error fetching products:', err);
-    res.status(500).json({ error: 'Database error.' });
+    res.status(500).json({ 
+      success: false, 
+      message: 'Database error occurred while fetching products' 
+    });
+  }
+});
+
+// GET /api/products/:id - fetch a single product with all related data
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Validate ID
+    if (!id || isNaN(parseInt(id))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid product ID'
+      });
+    }
+
+    // Get the main product
+    const product = await db.get('SELECT * FROM products WHERE id = ?', id);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
+
+    // If it's a course, get related data
+    if (product.product_type === 'course') {
+      try {
+        const [learningObjectives, requirements, courseContent] = await Promise.all([
+          getLearningObjectives(id),
+          getRequirements(id),
+          getCourseContent(id)
+        ]);
+
+        res.json({
+          success: true,
+          product: {
+            ...product,
+            learning_objectives: learningObjectives,
+            requirements: requirements,
+            course_content: courseContent
+          }
+        });
+      } catch (error) {
+        console.error('Error fetching course-related data:', error);
+        res.json({
+          success: true,
+          product: product
+        });
+      }
+    } else {
+      res.json({
+        success: true,
+        product: product
+      });
+    }
+
+  } catch (err) {
+    console.error('Error fetching product:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while fetching product'
+    });
+  }
+});
+
+// PUT /api/products/:id - update a product
+app.put('/api/products/:id', productUpload.fields([
+  { name: 'thumbnail', maxCount: 1 },
+  { name: 'product_image', maxCount: 1 },
+  { name: 'icon', maxCount: 1 },
+  { name: 'pdf_file', maxCount: 1 },
+  { name: 'instructor_image', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const data = req.body;
+    const files = req.files || {};
+    
+    // Validate ID
+    if (!id || isNaN(parseInt(id))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid product ID'
+      });
+    }
+
+    // Check if product exists
+    const product = await db.get('SELECT * FROM products WHERE id = ?', id);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
+
+    // Prepare update data
+    const updateFields = [];
+    const updateValues = [];
+    
+    // Basic fields
+    const fields = ['title', 'name', 'description', 'price', 'video_url', 'author', 
+                   'purchase_link', 'download_link', 'status', 'featured', 'subtitle',
+                   'instructor_name', 'instructor_title', 'instructor_bio', 'duration',
+                   'total_lectures', 'language', 'level', 'rating', 'total_ratings', 'enrolled_students'];
+    
+    for (const field of fields) {
+      if (data[field] !== undefined) {
+        let value = data[field];
+        if (field === 'price' && value === 'Free') value = null;
+        if (field === 'total_lectures' || field === 'total_ratings' || field === 'enrolled_students') {
+          value = parseInt(value) || 0;
+        }
+        if (field === 'rating') value = parseFloat(value) || 0.00;
+        if (field === 'featured') value = value === 'true' || value === '1' ? 1 : 0;
+        
+        updateFields.push(`${field} = ?`);
+        updateValues.push(value);
+      }
+    }
+    
+    // Handle file uploads
+    if (files.thumbnail) {
+      updateFields.push('thumbnail = ?');
+      updateValues.push('/uploads/courses/' + files.thumbnail[0].filename);
+    }
+    if (files.instructor_image) {
+      updateFields.push('instructor_image = ?');
+      updateValues.push('/uploads/instructors/' + files.instructor_image[0].filename);
+    }
+    if (files.product_image) {
+      updateFields.push('product_image = ?');
+      updateValues.push('/uploads/product_images/' + files.product_image[0].filename);
+    }
+    if (files.icon) {
+      updateFields.push('icon = ?');
+      updateValues.push('/uploads/icons/' + files.icon[0].filename);
+    }
+    if (files.pdf_file) {
+      updateFields.push('pdf_file = ?');
+      updateValues.push('/uploads/pdfs/' + files.pdf_file[0].filename);
+    }
+    
+    // Update main product
+    if (updateFields.length > 0) {
+      updateValues.push(id);
+      await db.run(`UPDATE products SET ${updateFields.join(', ')} WHERE id = ?`, ...updateValues);
+    }
+    
+    // If it's a course, update related data
+    if (product.product_type === 'course') {
+      try {
+        // Update learning objectives
+        if (data.learning_objectives && Array.isArray(data.learning_objectives)) {
+          await deleteLearningObjectives(id);
+          await createLearningObjectives(id, data.learning_objectives);
+        }
+        
+        // Update requirements
+        if (data.requirements && Array.isArray(data.requirements)) {
+          await deleteRequirements(id);
+          await createRequirements(id, data.requirements);
+        }
+        
+        // Update course content
+        if (data.course_content && Array.isArray(data.course_content)) {
+          await deleteCourseContent(id);
+          await createCourseContent(id, data.course_content);
+        }
+        
+        console.log('Course-related data updated successfully');
+      } catch (error) {
+        console.error('Error updating course-related data:', error);
+      }
+    }
+    
+    // Get updated product
+    const updatedProduct = await db.get('SELECT * FROM products WHERE id = ?', id);
+    
+    res.json({
+      success: true,
+      message: 'Product updated successfully',
+      product: updatedProduct
+    });
+
+  } catch (err) {
+    console.error('Error updating product:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while updating product'
+    });
+  }
+});
+
+// DELETE /api/products/:id - delete a product by ID
+app.delete('/api/products/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Validate ID
+    if (!id || isNaN(parseInt(id))) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid product ID'
+      });
+    }
+
+    // Check if product exists
+    const product = await db.get('SELECT * FROM products WHERE id = ?', id);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
+
+    // Delete the product (cascade will handle related data)
+    await db.run('DELETE FROM products WHERE id = ?', id);
+    
+    res.json({
+      success: true,
+      message: 'Product deleted successfully',
+      deletedProduct: product
+    });
+
+  } catch (err) {
+    console.error('Error deleting product:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while deleting product'
+    });
   }
 });
 
