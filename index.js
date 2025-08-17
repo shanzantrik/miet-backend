@@ -9,16 +9,62 @@ import fs from 'fs';
 import path from 'path';
 import bodyParser from 'body-parser';
 
+
 const app = express();
 app.use(express.json());
-app.use(cors());
+// CORS configuration
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    // Allow localhost and common development ports
+    const allowedOrigins = [
+      'http://localhost:3000',
+      'http://localhost:3001', 
+      'http://localhost:5173',
+      'http://127.0.0.1:3000',
+      'http://127.0.0.1:3001',
+      'http://127.0.0.1:5173'
+    ];
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      // Log blocked origins for debugging
+      console.log('CORS blocked origin:', origin);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
+
+// Handle preflight requests
+app.options('*', cors(corsOptions));
+
 app.use(bodyParser.json());
 
-const JWT_SECRET = 'your_jwt_secret'; // Change this in production
+// Environment variables with defaults
+const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_change_in_production';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+const PAYMENT_GATEWAY_API_KEY = process.env.PAYMENT_GATEWAY_API_KEY || 'test_key';
+const PAYMENT_GATEWAY_SECRET = process.env.PAYMENT_GATEWAY_SECRET || 'test_secret';
+const SMTP_HOST = process.env.SMTP_HOST || 'localhost';
+const SMTP_PORT = process.env.SMTP_PORT || 587;
+const SMTP_USER = process.env.SMTP_USER || 'test@example.com';
+const SMTP_PASS = process.env.SMTP_PASS || 'test_password';
+
 const INIT_DB = process.argv.includes('--initdb');
 
 // --- SQLite setup ---
 let db;
+
+
 
 async function setupDatabase() {
   db = await open({
@@ -282,7 +328,7 @@ async function setupDatabase() {
   // ... existing code ...
 })();
 
-// --- Auth Middleware ---
+// --- Enhanced Auth Middleware ---
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -293,6 +339,81 @@ function authenticateToken(req, res, next) {
     next();
   });
 }
+
+// Enhanced authentication middleware for e-commerce
+function authenticateUser(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ 
+      success: false,
+      message: 'Access token required' 
+    });
+  }
+  
+  jwt.verify(token, JWT_SECRET, async (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ 
+        success: false,
+        message: 'Invalid or expired token' 
+      });
+    }
+    
+    try {
+      // Get user from database
+      const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.userId);
+      if (!user) {
+        return res.status(404).json({ 
+          success: false,
+          message: 'User not found' 
+        });
+      }
+      
+      req.user = user;
+      next();
+    } catch (error) {
+      console.error('Error authenticating user:', error);
+      return res.status(500).json({ 
+        success: false,
+        message: 'Authentication error' 
+      });
+    }
+  });
+}
+
+// Simple rate limiting middleware
+const checkoutLimiter = (req, res, next) => {
+  // Simple in-memory rate limiting (in production, use Redis or similar)
+  const clientIP = req.ip || req.connection.remoteAddress;
+  const now = Date.now();
+  const windowMs = 15 * 60 * 1000; // 15 minutes
+  const maxRequests = 10;
+  
+  if (!req.app.locals.rateLimit) {
+    req.app.locals.rateLimit = new Map();
+  }
+  
+  const clientData = req.app.locals.rateLimit.get(clientIP) || { count: 0, resetTime: now + windowMs };
+  
+  if (now > clientData.resetTime) {
+    clientData.count = 1;
+    clientData.resetTime = now + windowMs;
+  } else {
+    clientData.count++;
+  }
+  
+  req.app.locals.rateLimit.set(clientIP, clientData);
+  
+  if (clientData.count > maxRequests) {
+    return res.status(429).json({
+      success: false,
+      message: 'Too many checkout attempts, please try again later'
+    });
+  }
+  
+  next();
+};
 
 // --- Auth API ---
 app.post('/api/login', async (req, res) => {
@@ -305,6 +426,205 @@ app.post('/api/login', async (req, res) => {
   const userRow = await db.get('SELECT * FROM users WHERE username = ?', username);
   const token = jwt.sign({ id: userRow?.id, username: user.username, role: userRow?.role || 'superadmin' }, JWT_SECRET, { expiresIn: '1d' });
   res.json({ token });
+});
+
+// --- E-commerce User Authentication API ---
+
+// POST /api/auth/register - User registration
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { firstName, lastName, email, password, phone } = req.body;
+    
+    // Validation
+    if (!firstName || !lastName || !email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'First name, last name, email, and password are required'
+      });
+    }
+    
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters long'
+      });
+    }
+    
+    // Check if user already exists
+    const existingUser = await db.get('SELECT id FROM users_auth WHERE email = ?', email);
+    if (existingUser) {
+      return res.status(409).json({
+        success: false,
+        message: 'User with this email already exists'
+      });
+    }
+    
+    // Hash password
+    const passwordHash = await bcrypt.hash(password, 12);
+    
+    // Create user
+    const result = await db.run(`
+      INSERT INTO users_auth (first_name, last_name, email, password_hash, phone)
+      VALUES (?, ?, ?, ?, ?)
+    `, [firstName, lastName, email, passwordHash, phone || null]);
+    
+    const userId = result.lastID;
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId, email },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+    
+    // Get created user (without password)
+    const newUser = await db.get('SELECT id, first_name, last_name, email, phone, created_at FROM users_auth WHERE id = ?', userId);
+    
+    res.status(201).json({
+      success: true,
+      message: 'User registered successfully',
+      user: newUser,
+      token
+    });
+    
+  } catch (error) {
+    console.error('Error registering user:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating user account'
+    });
+  }
+});
+
+// POST /api/auth/login - User login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    // Validation
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email and password are required'
+      });
+    }
+    
+    // Find user
+    const user = await db.get('SELECT * FROM users_auth WHERE email = ?', email);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid email or password'
+      });
+    }
+    
+    // Verify password
+    const isValidPassword = await bcrypt.compare(password, user.password_hash);
+    if (!isValidPassword) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid email or password'
+      });
+    }
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+    
+    // Return user data (without password)
+    const userData = {
+      id: user.id,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      email: user.email,
+      phone: user.phone,
+      created_at: user.created_at
+    };
+    
+    res.json({
+      success: true,
+      message: 'Login successful',
+      user: userData,
+      token
+    });
+    
+  } catch (error) {
+    console.error('Error logging in user:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error during login'
+    });
+  }
+});
+
+// GET /api/auth/profile - Get user profile
+app.get('/api/auth/profile', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    // Get user profile
+    const user = await db.get('SELECT id, first_name, last_name, email, phone, created_at FROM users_auth WHERE id = ?', userId);
+    
+    // Get user addresses
+    const addresses = await db.all('SELECT * FROM user_addresses WHERE user_id = ? ORDER BY is_default DESC, created_at DESC', userId);
+    
+    res.json({
+      success: true,
+      user: {
+        ...user,
+        addresses
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error fetching user profile:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching user profile'
+    });
+  }
+});
+
+// PUT /api/auth/profile - Update user profile
+app.put('/api/auth/profile', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { first_name, last_name, phone } = req.body;
+    
+    // Validation
+    if (!first_name || !last_name) {
+      return res.status(400).json({
+        success: false,
+        message: 'First name and last name are required'
+      });
+    }
+    
+    // Update user profile
+    await db.run(`
+      UPDATE users_auth 
+      SET first_name = ?, last_name = ?, phone = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `, [first_name, last_name, phone || null, userId]);
+    
+    // Get updated user
+    const updatedUser = await db.get('SELECT id, first_name, last_name, email, phone, created_at, updated_at FROM users_auth WHERE id = ?', userId);
+    
+    res.json({
+      success: true,
+      message: 'Profile updated successfully',
+      user: updatedUser
+    });
+    
+  } catch (error) {
+    console.error('Error updating user profile:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating profile'
+    });
+  }
 });
 
 // --- Category CRUD ---
@@ -757,10 +1077,1183 @@ app.get('/api/test', (req, res) => {
   });
 });
 
+// Health check endpoint for CORS testing
+app.get('/api/health', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.json({ 
+    status: 'healthy', 
+    message: 'Backend is running and CORS is configured',
+    timestamp: new Date().toISOString(),
+    cors: 'enabled'
+  });
+});
+
+// --- Blog Routes ---
+
+// Multer configuration for blog thumbnails
+const blogStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const blogsDir = path.join(process.cwd(), 'uploads', 'blogs');
+    if (!fs.existsSync(blogsDir)) {
+      fs.mkdirSync(blogsDir, { recursive: true });
+    }
+    cb(null, blogsDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    let safeName = file.originalname
+      .toLowerCase()
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '') // Remove diacritics
+      .replace(/[^\x00-\x7F]/g, '') // Remove all non-ASCII characters
+      .replace(/\s+/g, '_') // Replace whitespace with _
+      .replace(/['"`]/g, '') // Remove apostrophes and quotes
+      .replace(/[^a-z0-9._-]/g, '_'); // Replace all other non-safe chars with _
+    cb(null, uniqueSuffix + '-' + safeName);
+  }
+});
+
+const blogUpload = multer({ 
+  storage: blogStorage,
+  fileFilter: (req, file, cb) => {
+    // Allow only image files
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed for thumbnails'), false);
+    }
+  },
+  limits: {
+    fileSize: 5 * 1024 * 1024 // 5MB limit
+  }
+});
+
+// Blog validation middleware
+const validateBlog = (req, res, next) => {
+  const { title, description, author, category } = req.body;
+  
+  if (!title || !title.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Title is required'
+    });
+  }
+  
+  if (!description || !description.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Description is required'
+    });
+  }
+  
+  if (!author || !author.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Author is required'
+    });
+  }
+  
+  if (!category || !category.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: 'Category is required'
+    });
+  }
+  
+  // Validate category values
+  const validCategories = ['Therapy', 'Mental Health', 'Education', 'Support', 'Technology'];
+  if (!validCategories.includes(category)) {
+    return res.status(400).json({
+      success: false,
+      message: 'Category must be one of: Therapy, Mental Health, Education, Support, Technology'
+    });
+  }
+  
+  // Validate status if provided
+  const validStatuses = ['active', 'inactive', 'published', 'draft', 'pending', 'archived', 'live', 'scheduled', 'private', 'public', 'review', 'approved', 'rejected', 'trash', 'deleted'];
+  if (req.body.status && !validStatuses.includes(req.body.status)) {
+    return res.status(400).json({
+      success: false,
+      message: `Status must be one of: ${validStatuses.join(', ')}`
+    });
+  }
+  
+  next();
+};
+
+// POST /api/blogs - Create a new blog
+app.post('/api/blogs', blogUpload.single('thumbnail'), validateBlog, async (req, res) => {
+  try {
+    const { title, description, category, author, status } = req.body;
+    const thumbnail = req.file ? `/uploads/blogs/${req.file.filename}` : null;
+    
+    // Ensure status is valid, default to 'draft' if not provided or invalid
+    const validStatuses = ['active', 'inactive', 'published', 'draft', 'pending', 'archived', 'live', 'scheduled', 'private', 'public', 'review', 'approved', 'rejected', 'trash', 'deleted'];
+    const validStatus = (status && validStatuses.includes(status)) ? status : 'draft';
+    
+    const result = await db.run(`
+      INSERT INTO blogs (title, description, category, thumbnail, author, status, date)
+      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `, [title.trim(), description.trim(), category, thumbnail, author.trim(), validStatus]);
+    
+    const blogId = result.lastID;
+    
+    // Fetch the created blog
+    const newBlog = await db.get('SELECT * FROM blogs WHERE id = ?', blogId);
+    
+    res.status(201).json({
+      success: true,
+      message: 'Blog created successfully',
+      blog: newBlog
+    });
+    
+  } catch (error) {
+    console.error('Error creating blog:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while creating blog'
+    });
+  }
+});
+
+// GET /api/blogs - Get all blogs with optional filtering
+app.get('/api/blogs', async (req, res) => {
+  try {
+    let sql = 'SELECT * FROM blogs WHERE 1=1';
+    let params = [];
+    
+    // Add filters
+    if (req.query.category) {
+      sql += ' AND LOWER(category) = LOWER(?)';
+      params.push(req.query.category);
+    }
+    
+    if (req.query.status) {
+      sql += ' AND status = ?';
+      params.push(req.query.status);
+    }
+    
+    if (req.query.author) {
+      sql += ' AND LOWER(author) LIKE LOWER(?)';
+      params.push(`%${req.query.author}%`);
+    }
+    
+    // Add search functionality
+    if (req.query.search) {
+      sql += ' AND (LOWER(title) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?))';
+      const searchTerm = `%${req.query.search}%`;
+      params.push(searchTerm, searchTerm);
+    }
+    
+    sql += ' ORDER BY date DESC';
+    
+    const blogs = await db.all(sql, params);
+    
+    res.json({
+      success: true,
+      blogs: blogs,
+      count: blogs.length
+    });
+    
+  } catch (error) {
+    console.error('Error fetching blogs:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while fetching blogs'
+    });
+  }
+});
+
+// GET /api/blogs/:id - Get a single blog by ID
+app.get('/api/blogs/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const blog = await db.get('SELECT * FROM blogs WHERE id = ?', id);
+    
+    if (!blog) {
+      return res.status(404).json({
+        success: false,
+        message: 'Blog not found'
+      });
+    }
+    
+    res.json({
+      success: true,
+      blog: blog
+    });
+    
+  } catch (error) {
+    console.error('Error fetching blog:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while fetching blog'
+    });
+  }
+});
+
+// PUT /api/blogs/:id - Update a blog
+app.put('/api/blogs/:id', blogUpload.single('thumbnail'), validateBlog, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { title, description, category, author, status } = req.body;
+    
+    // Check if blog exists
+    const existingBlog = await db.get('SELECT * FROM blogs WHERE id = ?', id);
+    if (!existingBlog) {
+      return res.status(404).json({
+        success: false,
+        message: 'Blog not found'
+      });
+    }
+    
+    let thumbnail = existingBlog.thumbnail;
+    if (req.file) {
+      // Delete old thumbnail if it exists
+      if (existingBlog.thumbnail) {
+        const oldThumbnailPath = path.join(process.cwd(), existingBlog.thumbnail);
+        if (fs.existsSync(oldThumbnailPath)) {
+          fs.unlinkSync(oldThumbnailPath);
+        }
+      }
+      thumbnail = `/uploads/blogs/${req.file.filename}`;
+    }
+    
+    // Ensure status is valid, default to 'draft' if not provided or invalid
+    const validStatuses = ['active', 'inactive', 'published', 'draft', 'pending', 'archived', 'live', 'scheduled', 'private', 'public', 'review', 'approved', 'rejected', 'trash', 'deleted'];
+    const validStatus = (status && validStatuses.includes(status)) ? status : 'draft';
+    
+    await db.run(`
+      UPDATE blogs 
+      SET title = ?, description = ?, category = ?, thumbnail = ?, author = ?, status = ?, date = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `, [title.trim(), description.trim(), category, thumbnail, author.trim(), validStatus, id]);
+    
+    // Fetch the updated blog
+    const updatedBlog = await db.get('SELECT * FROM blogs WHERE id = ?', id);
+    
+    res.json({
+      success: true,
+      message: 'Blog updated successfully',
+      blog: updatedBlog
+    });
+    
+  } catch (error) {
+    console.error('Error updating blog:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while updating blog'
+    });
+  }
+});
+
+// DELETE /api/blogs/:id - Delete a blog
+app.delete('/api/blogs/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Check if blog exists
+    const existingBlog = await db.get('SELECT * FROM blogs WHERE id = ?', id);
+    if (!existingBlog) {
+      return res.status(404).json({
+        success: false,
+        message: 'Blog not found'
+      });
+    }
+    
+    // Delete thumbnail file if it exists
+    if (existingBlog.thumbnail) {
+      const oldThumbnailPath = path.join(process.cwd(), existingBlog.thumbnail);
+      if (fs.existsSync(oldThumbnailPath)) {
+        fs.unlinkSync(oldThumbnailPath);
+      }
+    }
+    
+    await db.run('DELETE FROM blogs WHERE id = ?', id);
+    
+    res.json({
+      success: true,
+      message: 'Blog deleted successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error deleting blog:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while deleting blog'
+    });
+  }
+});
+
+// --- Order Management API ---
+
+// POST /api/orders - Create new order
+app.post('/api/orders', authenticateUser, checkoutLimiter, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { items, deliveryAddress, paymentMethod } = req.body;
+    
+    // Validation
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Order items are required'
+      });
+    }
+    
+    if (!deliveryAddress || !paymentMethod) {
+      return res.status(400).json({
+        success: false,
+        message: 'Delivery address and payment method are required'
+      });
+    }
+    
+    // Calculate total amount and validate inventory
+    let totalAmount = 0;
+    const orderItems = [];
+    
+    for (const item of items) {
+      const { productId, quantity } = item;
+      
+      // Get product details
+      const product = await db.get('SELECT * FROM products WHERE id = ?', productId);
+      if (!product) {
+        return res.status(404).json({
+          success: false,
+          message: `Product with ID ${productId} not found`
+        });
+      }
+      
+      // Check inventory
+      const inventory = await db.get('SELECT available_quantity FROM product_inventory WHERE product_id = ?', productId);
+      if (!inventory || inventory.available_quantity < quantity) {
+        return res.status(400).json({
+          success: false,
+          message: `Insufficient inventory for product: ${product.title || product.name}`
+        });
+      }
+      
+      const itemTotal = (product.price || 0) * quantity;
+      totalAmount += itemTotal;
+      
+      orderItems.push({
+        productId,
+        productType: product.product_type,
+        productName: product.title || product.name,
+        quantity,
+        unitPrice: product.price || 0,
+        totalPrice: itemTotal
+      });
+    }
+    
+    // Generate order number
+    const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+    
+    // Create order
+    const orderResult = await db.run(`
+      INSERT INTO orders_new (user_id, order_number, total_amount, payment_method, delivery_address)
+      VALUES (?, ?, ?, ?, ?)
+    `, [userId, orderNumber, totalAmount, paymentMethod, JSON.stringify(deliveryAddress)]);
+    
+    const orderId = orderResult.lastID;
+    
+    // Create order items
+    for (const item of orderItems) {
+      await db.run(`
+        INSERT INTO order_items_new (order_id, product_id, product_type, product_name, quantity, unit_price, total_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `, [orderId, item.productId, item.productType, item.productName, item.quantity, item.unitPrice, item.totalPrice]);
+      
+      // Update inventory
+      await db.run(`
+        UPDATE product_inventory 
+        SET available_quantity = available_quantity - ?, updated_at = CURRENT_TIMESTAMP
+        WHERE product_id = ?
+      `, [item.quantity, item.productId]);
+    }
+    
+    // Create initial status history
+    await db.run(`
+      INSERT INTO order_status_history (order_id, status, notes)
+      VALUES (?, ?, ?)
+    `, [orderId, 'pending', 'Order created successfully']);
+    
+    // Get created order with items
+    const order = await db.get('SELECT * FROM orders_new WHERE id = ?', orderId);
+    const orderItemsData = await db.all('SELECT * FROM order_items_new WHERE order_id = ?', orderId);
+    
+    res.status(201).json({
+      success: true,
+      message: 'Order created successfully',
+      order: {
+        ...order,
+        items: orderItemsData
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error creating order:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating order'
+    });
+  }
+});
+
+// GET /api/orders/user/:userId - Get all orders for a specific user
+app.get('/api/orders/user/:userId', authenticateUser, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const authenticatedUserId = req.user.id;
+    
+    // Ensure user can only access their own orders
+    if (parseInt(userId) !== authenticatedUserId) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied'
+      });
+    }
+    
+    const orders = await db.all(`
+      SELECT o.*, 
+             COUNT(oi.id) as items_count
+      FROM orders_new o
+      LEFT JOIN order_items_new oi ON o.id = oi.order_id
+      WHERE o.user_id = ?
+      GROUP BY o.id
+      ORDER BY o.created_at DESC
+    `, [userId]);
+    
+    res.json({
+      success: true,
+      orders
+    });
+    
+  } catch (error) {
+    console.error('Error fetching user orders:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching orders'
+    });
+  }
+});
+
+// GET /api/orders/:orderId - Get specific order details
+app.get('/api/orders/:orderId', authenticateUser, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const userId = req.user.id;
+    
+    // Get order
+    const order = await db.get('SELECT * FROM orders_new WHERE id = ? AND user_id = ?', [orderId, userId]);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+    
+    // Get order items
+    const orderItems = await db.all('SELECT * FROM order_items_new WHERE order_id = ?', orderId);
+    
+    // Get order status history
+    const statusHistory = await db.all('SELECT * FROM order_status_history WHERE order_id = ? ORDER BY created_at ASC', orderId);
+    
+    res.json({
+      success: true,
+      order: {
+        ...order,
+        items: orderItems,
+        statusHistory
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error fetching order details:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching order details'
+    });
+  }
+});
+
+// PUT /api/orders/:orderId/status - Update order status
+app.put('/api/orders/:orderId/status', authenticateUser, async (req, res) => {
+  try {
+    const { orderId } = req.params;
+    const { status, notes } = req.body;
+    const userId = req.user.id;
+    
+    // Validation
+    const validStatuses = ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
+      });
+    }
+    
+    // Get order
+    const order = await db.get('SELECT * FROM orders_new WHERE id = ? AND user_id = ?', [orderId, userId]);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+    
+    // Update order status
+    await db.run(`
+      UPDATE orders_new 
+      SET status = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `, [orderId, status]);
+    
+    // Add status history
+    await db.run(`
+      INSERT INTO order_status_history (order_id, status, notes)
+      VALUES (?, ?, ?)
+    `, [orderId, status, notes || null]);
+    
+    res.json({
+      success: true,
+      message: 'Order status updated successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error updating order status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating order status'
+    });
+  }
+});
+
+// --- Payment Integration API ---
+
+// POST /api/payments/initialize - Initialize payment
+app.post('/api/payments/initialize', authenticateUser, async (req, res) => {
+  try {
+    const { orderId, amount, paymentMethod, currency = 'INR' } = req.body;
+    
+    // Validation
+    if (!orderId || !amount || !paymentMethod) {
+      return res.status(400).json({
+        success: false,
+        message: 'Order ID, amount, and payment method are required'
+      });
+    }
+    
+    // Verify order exists and belongs to user
+    const order = await db.get('SELECT * FROM orders_new WHERE id = ? AND user_id = ?', [orderId, req.user.id]);
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+    
+    // Verify amount matches order total
+    if (parseFloat(amount) !== parseFloat(order.total_amount)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Payment amount does not match order total'
+      });
+    }
+    
+    // Generate transaction ID
+    const transactionId = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+    
+    // Create payment record
+    const paymentResult = await db.run(`
+      INSERT INTO payments (order_id, payment_method, amount, currency, transaction_id)
+      VALUES (?, ?, ?, ?, ?)
+    `, [orderId, paymentMethod, amount, currency, transactionId]);
+    
+    const paymentId = paymentResult.lastID;
+    
+    // Simulate payment gateway response (replace with actual gateway integration)
+    const gatewayResponse = {
+      payment_id: paymentId,
+      transaction_id: transactionId,
+      status: 'pending',
+      gateway: 'test_gateway',
+      timestamp: new Date().toISOString()
+    };
+    
+    // Update payment with gateway response
+    await db.run(`
+      UPDATE payments 
+      SET gateway_response = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `, [JSON.stringify(gatewayResponse), paymentId]);
+    
+    res.json({
+      success: true,
+      message: 'Payment initialized successfully',
+      payment: {
+        id: paymentId,
+        transactionId,
+        amount,
+        currency,
+        status: 'pending',
+        gatewayResponse
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error initializing payment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error initializing payment'
+    });
+  }
+});
+
+// POST /api/payments/webhook - Receive payment status updates
+app.post('/api/payments/webhook', async (req, res) => {
+  try {
+    const { transactionId, status, gatewayData } = req.body;
+    
+    // In production, verify webhook signature here
+    // const signature = req.headers['x-webhook-signature'];
+    // if (!verifyWebhookSignature(signature, req.body)) {
+    //   return res.status(401).json({ error: 'Invalid signature' });
+    // }
+    
+    if (!transactionId || !status) {
+      return res.status(400).json({
+        success: false,
+        message: 'Transaction ID and status are required'
+      });
+    }
+    
+    // Find payment by transaction ID
+    const payment = await db.get('SELECT * FROM payments WHERE transaction_id = ?', transactionId);
+    if (!payment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment not found'
+      });
+    }
+    
+    // Update payment status
+    await db.run(`
+      UPDATE payments 
+      SET status = ?, gateway_response = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `, [status, JSON.stringify(gatewayData || {}), payment.id]);
+    
+    // Update order payment status
+    const orderStatus = status === 'completed' ? 'paid' : 
+                       status === 'failed' ? 'failed' : 'pending';
+    
+    await db.run(`
+      UPDATE orders_new 
+      SET payment_status = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `, [orderStatus, payment.order_id]);
+    
+    // Add order status history
+    if (status === 'completed') {
+      await db.run(`
+        INSERT INTO order_status_history (order_id, status, notes)
+        VALUES (?, ?, ?)
+      `, [payment.order_id, 'confirmed', 'Payment completed successfully']);
+    }
+    
+    res.json({
+      success: true,
+      message: 'Payment status updated successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error processing payment webhook:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error processing webhook'
+    });
+  }
+});
+
+// GET /api/payments/:paymentId/status - Get payment status
+app.get('/api/payments/:paymentId/status', authenticateUser, async (req, res) => {
+  try {
+    const { paymentId } = req.params;
+    
+    const payment = await db.get(`
+      SELECT p.*, o.order_number, o.total_amount 
+      FROM payments p
+      JOIN orders_new o ON p.order_id = o.id
+      WHERE p.id = ? AND o.user_id = ?
+    `, [paymentId, req.user.id]);
+    
+    if (!payment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Payment not found'
+      });
+    }
+    
+    res.json({
+      success: true,
+      payment
+    });
+    
+  } catch (error) {
+    console.error('Error fetching payment status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching payment status'
+    });
+  }
+});
+
+// --- Inventory Management API ---
+
+// GET /api/inventory/check - Check product availability
+app.get('/api/inventory/check', async (req, res) => {
+  try {
+    const { productId, quantity = 1 } = req.query;
+    
+    if (!productId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Product ID is required'
+      });
+    }
+    
+    // Get product details
+    const product = await db.get('SELECT * FROM products WHERE id = ?', productId);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
+    
+    // Get inventory
+    const inventory = await db.get('SELECT * FROM product_inventory WHERE product_id = ?', productId);
+    
+    if (!inventory) {
+      return res.json({
+        success: true,
+        available: false,
+        message: 'Product inventory not found',
+        product: {
+          id: product.id,
+          name: product.title || product.name,
+          type: product.product_type
+        }
+      });
+    }
+    
+    const available = inventory.available_quantity >= quantity;
+    const stockLevel = inventory.available_quantity;
+    const lowStock = stockLevel <= inventory.min_stock_level;
+    
+    res.json({
+      success: true,
+      available,
+      quantity: parseInt(quantity),
+      stockLevel,
+      lowStock,
+      product: {
+        id: product.id,
+        name: product.title || product.name,
+        type: product.product_type
+      },
+      inventory: {
+        available: inventory.available_quantity,
+        reserved: inventory.reserved_quantity,
+        minStock: inventory.min_stock_level
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error checking inventory:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error checking inventory'
+    });
+  }
+});
+
+// PUT /api/inventory/update - Update inventory
+app.put('/api/inventory/update', authenticateUser, async (req, res) => {
+  try {
+    const { productId, quantity, operation } = req.body;
+    
+    // Validation
+    if (!productId || quantity === undefined || !operation) {
+      return res.status(400).json({
+        success: false,
+        message: 'Product ID, quantity, and operation are required'
+      });
+    }
+    
+    const validOperations = ['add', 'subtract', 'set'];
+    if (!validOperations.includes(operation)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Operation must be one of: add, subtract, set'
+      });
+    }
+    
+    // Get current inventory
+    let inventory = await db.get('SELECT * FROM product_inventory WHERE product_id = ?', productId);
+    
+    if (!inventory) {
+      // Create inventory record if it doesn't exist
+      const result = await db.run(`
+        INSERT INTO product_inventory (product_id, product_type, available_quantity, reserved_quantity, min_stock_level)
+        VALUES (?, ?, 0, 0, 5)
+      `, [productId, 'product']);
+      
+      inventory = {
+        id: result.lastID,
+        product_id: productId,
+        available_quantity: 0,
+        reserved_quantity: 0,
+        min_stock_level: 5
+      };
+    }
+    
+    let newQuantity;
+    switch (operation) {
+      case 'add':
+        newQuantity = inventory.available_quantity + parseInt(quantity);
+        break;
+      case 'subtract':
+        newQuantity = Math.max(0, inventory.available_quantity - parseInt(quantity));
+        break;
+      case 'set':
+        newQuantity = parseInt(quantity);
+        break;
+    }
+    
+    // Update inventory
+    await db.run(`
+      UPDATE product_inventory 
+      SET available_quantity = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE product_id = ?
+    `, [newQuantity, productId]);
+    
+    // Get updated inventory
+    const updatedInventory = await db.get('SELECT * FROM product_inventory WHERE product_id = ?', productId);
+    
+    res.json({
+      success: true,
+      message: `Inventory ${operation}ed successfully`,
+      inventory: updatedInventory,
+      operation,
+      quantity: parseInt(quantity),
+      previousQuantity: inventory.available_quantity,
+      newQuantity
+    });
+    
+  } catch (error) {
+    console.error('Error updating inventory:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating inventory'
+    });
+  }
+});
+
+// --- Email & Notification System API ---
+
+// POST /api/notifications/email/order-confirmation - Send order confirmation email
+app.post('/api/notifications/email/order-confirmation', authenticateUser, async (req, res) => {
+  try {
+    const { orderId } = req.body;
+    const userId = req.user.id;
+    
+    if (!orderId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Order ID is required'
+      });
+    }
+    
+    // Get order details
+    const order = await db.get(`
+      SELECT o.*, u.first_name, u.last_name, u.email
+      FROM orders_new o
+      JOIN users_auth u ON o.user_id = u.id
+      WHERE o.id = ? AND o.user_id = ?
+    `, [orderId, userId]);
+    
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+    
+    // Get order items
+    const orderItems = await db.all('SELECT * FROM order_items_new WHERE order_id = ?', orderId);
+    
+    // Simulate email sending (replace with actual SMTP integration)
+    const emailData = {
+      to: order.email,
+      subject: `Order Confirmation - ${order.order_number}`,
+      template: 'order-confirmation',
+      data: {
+        orderNumber: order.order_number,
+        customerName: `${order.first_name} ${order.last_name}`,
+        totalAmount: order.total_amount,
+        items: orderItems,
+        orderDate: order.created_at,
+        deliveryAddress: JSON.parse(order.delivery_address)
+      }
+    };
+    
+    // In production, send actual email here
+    // await sendEmail(emailData);
+    
+    console.log('Order confirmation email would be sent:', emailData);
+    
+    res.json({
+      success: true,
+      message: 'Order confirmation email sent successfully',
+      emailData
+    });
+    
+  } catch (error) {
+    console.error('Error sending order confirmation email:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error sending email'
+    });
+  }
+});
+
+// POST /api/notifications/email/shipping-update - Send shipping status updates
+app.post('/api/notifications/email/shipping-update', authenticateUser, async (req, res) => {
+  try {
+    const { orderId, status, trackingNumber, estimatedDelivery } = req.body;
+    const userId = req.user.id;
+    
+    if (!orderId || !status) {
+      return res.status(400).json({
+        success: false,
+        message: 'Order ID and status are required'
+      });
+    }
+    
+    // Get order details
+    const order = await db.get(`
+      SELECT o.*, u.first_name, u.last_name, u.email
+      FROM orders_new o
+      JOIN users_auth u ON o.user_id = u.id
+      WHERE o.id = ? AND o.user_id = ?
+    `, [orderId, userId]);
+    
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+    
+    // Simulate email sending (replace with actual SMTP integration)
+    const emailData = {
+      to: order.email,
+      subject: `Shipping Update - Order ${order.order_number}`,
+      template: 'shipping-update',
+      data: {
+        orderNumber: order.order_number,
+        customerName: `${order.first_name} ${order.last_name}`,
+        status,
+        trackingNumber: trackingNumber || 'N/A',
+        estimatedDelivery: estimatedDelivery || 'TBD',
+        orderDate: order.created_at
+      }
+    };
+    
+    // In production, send actual email here
+    // await sendEmail(emailData);
+    
+    console.log('Shipping update email would be sent:', emailData);
+    
+    res.json({
+      success: true,
+      message: 'Shipping update email sent successfully',
+      emailData
+    });
+    
+  } catch (error) {
+    console.error('Error sending shipping update email:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error sending email'
+    });
+  }
+});
+
+// --- User Address Management API ---
+
+// POST /api/auth/addresses - Add new address
+app.post('/api/auth/addresses', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { addressLine1, city, state, zipCode, country = 'India', isDefault = false } = req.body;
+    
+    // Validation
+    if (!addressLine1 || !city || !state || !zipCode) {
+      return res.status(400).json({
+        success: false,
+        message: 'Address line 1, city, state, and zip code are required'
+      });
+    }
+    
+    // If this is the first address or marked as default, unset other defaults
+    if (isDefault) {
+      await db.run('UPDATE user_addresses SET is_default = 0 WHERE user_id = ?', userId);
+    }
+    
+    // Create address
+    const result = await db.run(`
+      INSERT INTO user_addresses (user_id, address_line1, city, state, zip_code, country, is_default)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [userId, addressLine1, city, state, zipCode, country, isDefault ? 1 : 0]);
+    
+    const addressId = result.lastID;
+    
+    // Get created address
+    const newAddress = await db.get('SELECT * FROM user_addresses WHERE id = ?', addressId);
+    
+    res.status(201).json({
+      success: true,
+      message: 'Address added successfully',
+      address: newAddress
+    });
+    
+  } catch (error) {
+    console.error('Error adding address:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error adding address'
+    });
+  }
+});
+
+// GET /api/auth/addresses - Get user addresses
+app.get('/api/auth/addresses', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    const addresses = await db.all(`
+      SELECT * FROM user_addresses 
+      WHERE user_id = ? 
+      ORDER BY is_default DESC, created_at DESC
+    `, [userId]);
+    
+    res.json({
+      success: true,
+      addresses
+    });
+    
+  } catch (error) {
+    console.error('Error fetching addresses:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching addresses'
+    });
+  }
+});
+
+// PUT /api/auth/addresses/:addressId - Update address
+app.put('/api/auth/addresses/:addressId', authenticateUser, async (req, res) => {
+  try {
+    const { addressId } = req.params;
+    const userId = req.user.id;
+    const { addressLine1, city, state, zipCode, country, isDefault } = req.body;
+    
+    // Check if address exists and belongs to user
+    const existingAddress = await db.get('SELECT * FROM user_addresses WHERE id = ? AND user_id = ?', [addressId, userId]);
+    if (!existingAddress) {
+      return res.status(404).json({
+        success: false,
+        message: 'Address not found'
+      });
+    }
+    
+    // If setting as default, unset other defaults
+    if (isDefault) {
+      await db.run('UPDATE user_addresses SET is_default = 0 WHERE user_id = ?', userId);
+    }
+    
+    // Update address
+    await db.run(`
+      UPDATE user_addresses 
+      SET address_line1 = ?, city = ?, state = ?, zip_code = ?, country = ?, is_default = ?
+      WHERE id = ? AND user_id = ?
+    `, [addressLine1, city, state, zipCode, country, isDefault ? 1 : 0, addressId, userId]);
+    
+    // Get updated address
+    const updatedAddress = await db.get('SELECT * FROM user_addresses WHERE id = ?', addressId);
+    
+    res.json({
+      success: true,
+      message: 'Address updated successfully',
+      address: updatedAddress
+    });
+    
+  } catch (error) {
+    console.error('Error updating address:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating address'
+    });
+  }
+});
+
+// DELETE /api/auth/addresses/:addressId - Delete address
+app.delete('/api/auth/addresses/:addressId', authenticateUser, async (req, res) => {
+  try {
+    const { addressId } = req.params;
+    const userId = req.user.id;
+    
+    // Check if address exists and belongs to user
+    const existingAddress = await db.get('SELECT * FROM user_addresses WHERE id = ? AND user_id = ?', [addressId, userId]);
+    if (!existingAddress) {
+      return res.status(404).json({
+        success: false,
+        message: 'Address not found'
+      });
+    }
+    
+    // Delete address
+    await db.run('DELETE FROM user_addresses WHERE id = ? AND user_id = ?', [addressId, userId]);
+    
+    res.json({
+      success: true,
+      message: 'Address deleted successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error deleting address:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting address'
+    });
+  }
+});
+
 // --- Start server ---
 const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Backend API running on http://localhost:${PORT}`);
+  
+  try {
+    await setupDatabase();
+    console.log('Database initialized.');
+  } catch (error) {
+    console.error('Error initializing database:', error);
+    process.exit(1);
+  }
 });
 
 // Ensure uploads directory exists and create organized subdirectories
@@ -771,9 +2264,10 @@ const iconsDir = path.join(uploadsDir, 'icons');
 const productImagesDir = path.join(uploadsDir, 'product_images');
 const instructorsDir = path.join(uploadsDir, 'instructors');
 const coursesDir = path.join(uploadsDir, 'courses');
+const blogsDir = path.join(uploadsDir, 'blogs');
 
 // Create directories if they don't exist
-[uploadsDir, thumbnailsDir, pdfsDir, iconsDir, productImagesDir, instructorsDir, coursesDir].forEach(dir => {
+[uploadsDir, thumbnailsDir, pdfsDir, iconsDir, productImagesDir, instructorsDir, coursesDir, blogsDir].forEach(dir => {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -804,6 +2298,7 @@ app.use('/uploads/icons', express.static(iconsDir));
 app.use('/uploads/product_images', express.static(productImagesDir));
 app.use('/uploads/instructors', express.static(instructorsDir));
 app.use('/uploads/courses', express.static(coursesDir));
+app.use('/uploads/blogs', express.static(blogsDir));
 app.use('/uploads', express.static(uploadsDir));
 // File upload endpoint
 app.post('/api/upload', upload.single('file'), (req, res) => {
@@ -955,6 +2450,27 @@ async function ensureProductsTableV2() {
     // Create course-related tables
     await ensureCourseTables();
     
+    // Ensure cart tables are also created
+    try {
+      await ensureCartTables();
+    } catch (error) {
+      console.error('Error ensuring cart tables:', error);
+    }
+    
+    // Ensure blogs table exists
+    try {
+      await ensureBlogsTable();
+    } catch (error) {
+      console.error('Error ensuring blogs table:', error);
+    }
+    
+    // Ensure e-commerce tables exist
+    try {
+      await ensureEcommerceTables();
+    } catch (error) {
+      console.error('Error ensuring e-commerce tables:', error);
+    }
+    
   } catch (error) {
     console.error('Error ensuring products table:', error);
     throw error;
@@ -1017,6 +2533,228 @@ async function ensureCourseTables() {
     console.log('Course-related tables ensured');
   } catch (error) {
     console.error('Error ensuring course tables:', error);
+    throw error;
+  }
+}
+
+// Ensure cart tables exist
+async function ensureCartTables() {
+  try {
+    // Cart table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS cart (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+      )
+    `);
+    
+    // Cart items table for better structure
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS cart_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cart_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER DEFAULT 1,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (cart_id) REFERENCES cart(id) ON DELETE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+      )
+    `);
+    
+    // Orders table for checkout
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        total_amount DECIMAL(10,2) NOT NULL,
+        status TEXT DEFAULT 'pending',
+        payment_method TEXT,
+        billing_address TEXT,
+        shipping_address TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Order items table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS order_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        price DECIMAL(10,2) NOT NULL,
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+      )
+    `);
+    
+    console.log('Cart tables ensured successfully');
+  } catch (error) {
+    console.error('Error creating cart tables:', error);
+    throw error;
+  }
+}
+
+// Ensure blogs table exists
+async function ensureBlogsTable() {
+  try {
+    // Check if blogs table exists
+    const tableExists = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='blogs'");
+    
+    if (tableExists) {
+      console.log('Blogs table already exists');
+      return;
+    }
+    
+    // Create blogs table
+    await db.exec(`
+      CREATE TABLE blogs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        category TEXT CHECK(category IN ('Therapy', 'Mental Health', 'Education', 'Support', 'Technology')) NOT NULL,
+        thumbnail TEXT,
+        author TEXT NOT NULL,
+        date DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT CHECK(status IN ('active', 'inactive', 'published', 'draft', 'pending', 'archived', 'live', 'scheduled', 'private', 'public', 'review', 'approved', 'rejected', 'trash', 'deleted')) NOT NULL DEFAULT 'draft'
+      );
+    `);
+    
+    console.log('Blogs table created successfully');
+  } catch (error) {
+    console.error('Error creating blogs table:', error);
+    throw error;
+  }
+}
+
+// Ensure e-commerce tables exist
+async function ensureEcommerceTables() {
+  try {
+    // Create users table for authentication
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS users_auth (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        first_name TEXT NOT NULL,
+        last_name TEXT NOT NULL,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        phone TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    
+    // Create user addresses table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS user_addresses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        address_line1 TEXT NOT NULL,
+        city TEXT NOT NULL,
+        state TEXT NOT NULL,
+        zip_code TEXT NOT NULL,
+        country TEXT NOT NULL DEFAULT 'India',
+        is_default BOOLEAN DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users_auth(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Create orders table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS orders_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        order_number TEXT UNIQUE NOT NULL,
+        total_amount DECIMAL(10,2) NOT NULL,
+        status TEXT CHECK(status IN ('pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled')) NOT NULL DEFAULT 'pending',
+        payment_method TEXT NOT NULL,
+        payment_status TEXT CHECK(payment_status IN ('pending', 'paid', 'failed', 'refunded')) NOT NULL DEFAULT 'pending',
+        delivery_address TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(user_id) REFERENCES users_auth(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Create order items table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS order_items_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        product_type TEXT NOT NULL,
+        product_name TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price DECIMAL(10,2) NOT NULL,
+        total_price DECIMAL(10,2) NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(order_id) REFERENCES orders_new(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Create order status history table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS order_status_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        notes TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(order_id) REFERENCES orders_new(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Create payments table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        payment_method TEXT NOT NULL,
+        amount DECIMAL(10,2) NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'INR',
+        status TEXT CHECK(status IN ('pending', 'processing', 'completed', 'failed', 'refunded')) NOT NULL DEFAULT 'pending',
+        transaction_id TEXT,
+        gateway_response TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(order_id) REFERENCES orders_new(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Create product inventory table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS product_inventory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        product_type TEXT NOT NULL,
+        available_quantity INTEGER NOT NULL DEFAULT 0,
+        reserved_quantity INTEGER NOT NULL DEFAULT 0,
+        min_stock_level INTEGER NOT NULL DEFAULT 5,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+      );
+    `);
+    
+    // Create indexes for performance
+    await db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders_new(user_id);
+      CREATE INDEX IF NOT EXISTS idx_orders_status ON orders_new(status);
+      CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders_new(created_at);
+      CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items_new(order_id);
+      CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id);
+      CREATE INDEX IF NOT EXISTS idx_user_addresses_user_id ON user_addresses(user_id);
+    `);
+    
+    console.log('E-commerce tables created successfully');
+  } catch (error) {
+    console.error('Error creating e-commerce tables:', error);
     throw error;
   }
 }
@@ -1469,47 +3207,86 @@ app.post('/api/products', productUpload.fields([
 // GET /api/products - fetch all products with optional filtering
 app.get('/api/products', async (req, res) => {
   console.log('Products endpoint called with query:', req.query);
-  await ensureProductsTableV2();
+  
   try {
-    const { type, status, featured } = req.query;
-    
     let sql = 'SELECT * FROM products WHERE 1=1';
-    const params = [];
+    let params = [];
     
-    // Filter by product type (case-insensitive)
-    if (type) {
+    // Add filters
+    if (req.query.type) {
       sql += ' AND LOWER(product_type) = LOWER(?)';
-      params.push(type);
+      params.push(req.query.type);
     }
     
-    // Filter by status
-    if (status) {
+    if (req.query.status) {
       sql += ' AND status = ?';
-      params.push(status);
+      params.push(req.query.status);
     }
     
-    // Filter by featured
-    if (featured !== undefined) {
+    if (req.query.featured !== undefined) {
       sql += ' AND featured = ?';
-      params.push(featured === 'true' ? 1 : 0);
+      params.push(req.query.featured === 'true' ? 1 : 0);
     }
     
     sql += ' ORDER BY created_at DESC';
-    
     console.log('Executing SQL:', sql, 'with params:', params);
     
     const products = await db.all(sql, params);
     console.log(`Found ${products.length} products`);
     
+    // Enhance products with related data for courses
+    const enhancedProducts = await Promise.all(products.map(async (product) => {
+      if (product.product_type === 'course') {
+        try {
+          const [objectives, requirements, content] = await Promise.all([
+            getLearningObjectives(product.id),
+            getRequirements(product.id),
+            getCourseContent(product.id)
+          ]);
+          
+          return {
+            ...product,
+            learning_objectives: objectives.map(obj => obj.objective),
+            requirements: requirements.map(req => req.requirement),
+            course_content: content.map(section => ({
+              section: section.section_name,
+              lectures: section.lectures_count,
+              duration: section.duration,
+              items: section.lectures || []
+            })),
+            type: product.product_type, // Add type field for frontend compatibility
+            updated_at: product.created_at // Add updated_at for frontend compatibility
+          };
+        } catch (error) {
+          console.error('Error fetching related data for product:', product.id, error);
+          return {
+            ...product,
+            learning_objectives: [],
+            requirements: [],
+            course_content: [],
+            type: product.product_type,
+            updated_at: product.created_at
+          };
+        }
+      } else {
+        return {
+          ...product,
+          type: product.product_type,
+          updated_at: product.created_at
+        };
+      }
+    }));
+    
     res.json({
       success: true,
-      products: products
+      products: enhancedProducts
     });
-  } catch (err) {
-    console.error('Error fetching products:', err);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Database error occurred while fetching products' 
+    
+  } catch (error) {
+    console.error('Error fetching products:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while fetching products'
     });
   }
 });
@@ -1745,6 +3522,383 @@ app.delete('/api/products/:id', async (req, res) => {
   }
 });
 
+// Cart Management Endpoints
+
+// Add item to cart
+app.post('/api/cart/add', async (req, res) => {
+  try {
+    console.log('Cart add endpoint called with:', req.body);
+    const { product_id, user_id, quantity = 1 } = req.body;
+    
+    if (!product_id || !user_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'Product ID and User ID are required'
+      });
+    }
+    
+    // Check if product exists
+    const product = await db.get('SELECT * FROM products WHERE id = ?', [product_id]);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
+      });
+    }
+    
+    console.log('Product found:', product.id);
+    
+    // Check if cart table exists
+    try {
+      const tableCheck = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='cart'");
+      console.log('Cart table check result:', tableCheck);
+      
+      if (!tableCheck) {
+        console.log('Cart table does not exist, creating it now...');
+        await ensureCartTables();
+      }
+    } catch (tableError) {
+      console.error('Error checking cart table:', tableError);
+    }
+    
+    // Check if item already exists in cart
+    const existingItem = await db.get(
+      'SELECT * FROM cart WHERE user_id = ? AND product_id = ?',
+      [user_id, product_id]
+    );
+    
+    if (existingItem) {
+      // Update quantity
+      await db.run(
+        'UPDATE cart SET quantity = quantity + ? WHERE id = ?',
+        [quantity, existingItem.id]
+      );
+    } else {
+      // Add new item
+      await db.run(
+        'INSERT INTO cart (user_id, product_id, quantity) VALUES (?, ?, ?)',
+        [user_id, product_id, quantity]
+      );
+    }
+    
+    res.json({
+      success: true,
+      message: 'Item added to cart successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error adding item to cart:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while adding item to cart',
+      error: error.message
+    });
+  }
+});
+
+// Get user's cart
+app.get('/api/cart', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'User ID is required'
+      });
+    }
+    
+    const cartItems = await db.all(`
+      SELECT c.id, c.quantity, c.created_at, p.*
+      FROM cart c
+      JOIN products p ON c.product_id = p.id
+      WHERE c.user_id = ?
+      ORDER BY c.created_at DESC
+    `, [user_id]);
+    
+    // Calculate total
+    const total = cartItems.reduce((sum, item) => {
+      return sum + (parseFloat(item.price) * item.quantity);
+    }, 0);
+    
+    res.json({
+      success: true,
+      cart: {
+        items: cartItems,
+        total: total.toFixed(2),
+        item_count: cartItems.length
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error fetching cart:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while fetching cart'
+    });
+  }
+});
+
+// Remove item from cart
+app.delete('/api/cart/remove/:item_id', async (req, res) => {
+  try {
+    const { item_id } = req.params;
+    
+    const result = await db.run('DELETE FROM cart WHERE id = ?', [item_id]);
+    
+    if (result.changes === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Cart item not found'
+      });
+    }
+    
+    res.json({
+      success: true,
+      message: 'Item removed from cart successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error removing item from cart:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while removing item from cart'
+    });
+  }
+});
+
+// Clear entire cart
+app.delete('/api/cart/clear', async (req, res) => {
+  try {
+    const { user_id } = req.body;
+    
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'User ID is required'
+      });
+    }
+    
+    await db.run('DELETE FROM cart WHERE user_id = ?', [user_id]);
+    
+    res.json({
+      success: true,
+      message: 'Cart cleared successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error clearing cart:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while clearing cart'
+    });
+  }
+});
+
+// Checkout endpoint
+app.post('/api/cart/checkout', async (req, res) => {
+  try {
+    console.log('Checkout endpoint called with:', req.body);
+    const { user_id, payment_method, billing_address, shipping_address } = req.body;
+    
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'User ID is required'
+      });
+    }
+    
+    // Check if orders table exists, create it if not
+    try {
+      const tableCheck = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='orders'");
+      console.log('Orders table check result:', tableCheck);
+      
+      if (!tableCheck) {
+        console.log('Orders table does not exist, creating it now...');
+        
+        // Create orders table directly
+        await db.run('CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, total_amount REAL NOT NULL, status TEXT, payment_method TEXT, billing_address TEXT, shipping_address TEXT, created_at TEXT, updated_at TEXT)');
+        
+        // Create order items table
+        await db.run('CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, product_id INTEGER NOT NULL, quantity INTEGER NOT NULL, price REAL NOT NULL)');
+        
+        console.log('Orders tables created successfully');
+      }
+    } catch (tableError) {
+      console.error('Error checking orders table:', tableError);
+    }
+    
+    // Get cart items
+    const cartItems = await db.all(`
+      SELECT c.quantity, p.id, p.price
+      FROM cart c
+      JOIN products p ON c.product_id = p.id
+      WHERE c.user_id = ?
+    `, [user_id]);
+    
+    console.log('Cart items found:', cartItems);
+    
+    if (cartItems.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Cart is empty'
+      });
+    }
+    
+    // Calculate total
+    const total = cartItems.reduce((sum, item) => {
+      return sum + (parseFloat(item.price) * item.quantity);
+    }, 0);
+    
+    console.log('Total calculated:', total);
+    
+    // Create order
+    const orderResult = await db.run(`
+      INSERT INTO orders (user_id, total_amount, payment_method, billing_address, shipping_address)
+      VALUES (?, ?, ?, ?, ?)
+    `, [user_id, total.toFixed(2), payment_method, JSON.stringify(billing_address), JSON.stringify(shipping_address)]);
+    
+    const orderId = orderResult.lastID;
+    console.log('Order created with ID:', orderId);
+    
+    // Create order items
+    for (const item of cartItems) {
+      await db.run(`
+        INSERT INTO order_items (order_id, product_id, quantity, price)
+        VALUES (?, ?, ?, ?)
+      `, [orderId, item.id, item.quantity, item.price]);
+    }
+    
+    console.log('Order items created');
+    
+    // Clear cart
+    await db.run('DELETE FROM cart WHERE user_id = ?', [user_id]);
+    
+    res.json({
+      success: true,
+      message: 'Checkout completed successfully',
+      order_id: orderId,
+      total: total.toFixed(2)
+    });
+    
+  } catch (error) {
+    console.error('Error during checkout:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred during checkout',
+      error: error.message
+    });
+  }
+});
+
+// Get order history
+app.get('/api/orders', async (req, res) => {
+  try {
+    const { user_id } = req.query;
+    
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'User ID is required'
+      });
+    }
+    
+    const orders = await db.all(`
+      SELECT o.*, 
+             COUNT(oi.id) as item_count
+      FROM orders o
+      LEFT JOIN order_items oi ON o.id = oi.order_id
+      WHERE o.user_id = ?
+      GROUP BY o.id
+      ORDER BY o.created_at DESC
+    `, [user_id]);
+    
+    res.json({
+      success: true,
+      orders: orders
+    });
+    
+  } catch (error) {
+    console.error('Error fetching orders:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while fetching orders'
+    });
+  }
+});
+
+// Debug endpoint to check database tables
+app.get('/api/debug/tables', async (req, res) => {
+  try {
+    const tables = await db.all("SELECT name FROM sqlite_master WHERE type='table'");
+    res.json({
+      success: true,
+      tables: tables.map(t => t.name)
+    });
+  } catch (error) {
+    console.error('Error checking tables:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while checking tables',
+      error: error.message
+    });
+  }
+});
+
+// Manual table creation endpoint for debugging
+app.post('/api/debug/create-orders-table', async (req, res) => {
+  try {
+    console.log('Creating orders table manually...');
+    
+    // Create orders table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        total_amount DECIMAL(10,2) NOT NULL,
+        status TEXT DEFAULT 'pending',
+        payment_method TEXT,
+        billing_address TEXT,
+        shipping_address TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    
+    // Create order items table
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS order_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        price DECIMAL(10,2) NOT NULL,
+        FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+      )
+    `);
+    
+    console.log('Orders tables created successfully');
+    res.json({
+      success: true,
+      message: 'Orders tables created successfully'
+    });
+    
+  } catch (error) {
+    console.error('Error creating orders tables:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while creating orders tables',
+      error: error.message
+    });
+  }
+});
+
+// Simple test endpoint
+app.get('/api/test-simple', (req, res) => {
+  res.json({ message: 'Simple test endpoint works!' });
+});
+
 // --- Catch-all 404 and error handler for JSON responses ---
 app.use((req, res, next) => {
   res.status(404).json({ error: 'Not found' });
@@ -1754,3 +3908,5 @@ app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
+
+
