@@ -17,22 +17,14 @@ const corsOptions = {
   origin: function (origin, callback) {
     // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
-    
-    // Allow localhost and common development ports
-    const allowedOrigins = [
-      'http://localhost:3000',
-      'http://localhost:3001', 
-      'http://localhost:5173',
-      'http://127.0.0.1:3000',
-      'http://127.0.0.1:3001',
-      'http://127.0.0.1:5173'
-    ];
-    
-    if (allowedOrigins.indexOf(origin) !== -1) {
+
+    // Check if origin is in allowed list
+    if (CORS_ORIGINS.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
       // Log blocked origins for debugging
       console.log('CORS blocked origin:', origin);
+      console.log('Allowed origins:', CORS_ORIGINS);
       callback(new Error('Not allowed by CORS'));
     }
   },
@@ -47,6 +39,15 @@ app.use(cors(corsOptions));
 // Handle preflight requests
 app.options('*', cors(corsOptions));
 
+// Add CORS headers to all responses as a fallback
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  next();
+});
+
 app.use(bodyParser.json());
 
 // Environment variables with defaults
@@ -58,6 +59,19 @@ const SMTP_HOST = process.env.SMTP_HOST || 'localhost';
 const SMTP_PORT = process.env.SMTP_PORT || 587;
 const SMTP_USER = process.env.SMTP_USER || 'test@example.com';
 const SMTP_PASS = process.env.SMTP_PASS || 'test_password';
+
+// CORS configuration with environment variable support
+const CORS_ORIGINS = process.env.CORS_ORIGINS ?
+  process.env.CORS_ORIGINS.split(',') :
+  [
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:3001',
+    'http://127.0.0.1:5173',
+    'https://miet-frontend-production.up.railway.app'
+  ];
 
 const INIT_DB = process.argv.includes('--initdb');
 
@@ -270,13 +284,13 @@ async function setupDatabase() {
     await db.exec("ALTER TABLE consultants ADD COLUMN city TEXT");
     console.log('Migrated: Added city column to consultants table.');
   }
-  
+
   // --- MIGRATION: Add featured column to consultants if missing ---
   if (!consultantCols.some(col => col.name === 'featured')) {
     await db.exec("ALTER TABLE consultants ADD COLUMN featured INTEGER DEFAULT 0");
     console.log('Migrated: Added featured column to consultants table.');
   }
-  
+
   // --- MIGRATION: Update products table schema if needed ---
   try {
     const productsCols = await db.all("PRAGMA table_info(products)");
@@ -284,13 +298,13 @@ async function setupDatabase() {
       // Check if we need to migrate from old schema
       const hasOldType = productsCols.some(col => col.name === 'type');
       const hasNewProductType = productsCols.some(col => col.name === 'product_type');
-      
+
       if (hasOldType && !hasNewProductType) {
         // Migrate old 'type' column to 'product_type'
         await db.exec("ALTER TABLE products RENAME COLUMN type TO product_type");
         console.log('Migrated: Renamed type column to product_type in products table.');
       }
-      
+
       // Add new columns if they don't exist
       const addCol = async (col, type) => {
         if (!productsCols.some(c => c.name === col)) {
@@ -298,7 +312,7 @@ async function setupDatabase() {
           console.log(`Migrated: Added ${col} column to products table.`);
         }
       };
-      
+
       await addCol('thumbnail', 'TEXT');
       await addCol('product_image', 'TEXT');
       await addCol('icon', 'TEXT');
@@ -307,7 +321,7 @@ async function setupDatabase() {
       await addCol('pdf_file', 'TEXT');
       await addCol('purchase_link', 'TEXT');
       await addCol('download_link', 'TEXT');
-      
+
       // If the table exists but doesn't have product_type, add it
       if (!hasNewProductType && !hasOldType) {
         await db.exec("ALTER TABLE products ADD COLUMN product_type TEXT");
@@ -344,39 +358,39 @@ function authenticateToken(req, res, next) {
 function authenticateUser(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  
+
   if (!token) {
-    return res.status(401).json({ 
+    return res.status(401).json({
       success: false,
-      message: 'Access token required' 
+      message: 'Access token required'
     });
   }
-  
+
   jwt.verify(token, JWT_SECRET, async (err, decoded) => {
     if (err) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         success: false,
-        message: 'Invalid or expired token' 
+        message: 'Invalid or expired token'
       });
     }
-    
+
     try {
       // Get user from database
       const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.userId);
       if (!user) {
-        return res.status(404).json({ 
+        return res.status(404).json({
           success: false,
-          message: 'User not found' 
+          message: 'User not found'
         });
       }
-      
+
       req.user = user;
       next();
     } catch (error) {
       console.error('Error authenticating user:', error);
-      return res.status(500).json({ 
+      return res.status(500).json({
         success: false,
-        message: 'Authentication error' 
+        message: 'Authentication error'
       });
     }
   });
@@ -389,29 +403,29 @@ const checkoutLimiter = (req, res, next) => {
   const now = Date.now();
   const windowMs = 15 * 60 * 1000; // 15 minutes
   const maxRequests = 10;
-  
+
   if (!req.app.locals.rateLimit) {
     req.app.locals.rateLimit = new Map();
   }
-  
+
   const clientData = req.app.locals.rateLimit.get(clientIP) || { count: 0, resetTime: now + windowMs };
-  
+
   if (now > clientData.resetTime) {
     clientData.count = 1;
     clientData.resetTime = now + windowMs;
   } else {
     clientData.count++;
   }
-  
+
   req.app.locals.rateLimit.set(clientIP, clientData);
-  
+
   if (clientData.count > maxRequests) {
     return res.status(429).json({
       success: false,
       message: 'Too many checkout attempts, please try again later'
     });
   }
-  
+
   next();
 };
 
@@ -434,7 +448,7 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { firstName, lastName, email, password, phone } = req.body;
-    
+
     // Validation
     if (!firstName || !lastName || !email || !password) {
       return res.status(400).json({
@@ -442,14 +456,14 @@ app.post('/api/auth/register', async (req, res) => {
         message: 'First name, last name, email, and password are required'
       });
     }
-    
+
     if (password.length < 6) {
       return res.status(400).json({
         success: false,
         message: 'Password must be at least 6 characters long'
       });
     }
-    
+
     // Check if user already exists
     const existingUser = await db.get('SELECT id FROM users_auth WHERE email = ?', email);
     if (existingUser) {
@@ -458,35 +472,35 @@ app.post('/api/auth/register', async (req, res) => {
         message: 'User with this email already exists'
       });
     }
-    
+
     // Hash password
     const passwordHash = await bcrypt.hash(password, 12);
-    
+
     // Create user
     const result = await db.run(`
       INSERT INTO users_auth (first_name, last_name, email, password_hash, phone)
       VALUES (?, ?, ?, ?, ?)
     `, [firstName, lastName, email, passwordHash, phone || null]);
-    
+
     const userId = result.lastID;
-    
+
     // Generate JWT token
     const token = jwt.sign(
       { userId, email },
       JWT_SECRET,
       { expiresIn: JWT_EXPIRES_IN }
     );
-    
+
     // Get created user (without password)
     const newUser = await db.get('SELECT id, first_name, last_name, email, phone, created_at FROM users_auth WHERE id = ?', userId);
-    
+
     res.status(201).json({
       success: true,
       message: 'User registered successfully',
       user: newUser,
       token
     });
-    
+
   } catch (error) {
     console.error('Error registering user:', error);
     res.status(500).json({
@@ -500,7 +514,7 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    
+
     // Validation
     if (!email || !password) {
       return res.status(400).json({
@@ -508,7 +522,7 @@ app.post('/api/auth/login', async (req, res) => {
         message: 'Email and password are required'
       });
     }
-    
+
     // Find user
     const user = await db.get('SELECT * FROM users_auth WHERE email = ?', email);
     if (!user) {
@@ -517,7 +531,7 @@ app.post('/api/auth/login', async (req, res) => {
         message: 'Invalid email or password'
       });
     }
-    
+
     // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
     if (!isValidPassword) {
@@ -526,14 +540,14 @@ app.post('/api/auth/login', async (req, res) => {
         message: 'Invalid email or password'
       });
     }
-    
+
     // Generate JWT token
     const token = jwt.sign(
       { userId: user.id, email: user.email },
       JWT_SECRET,
       { expiresIn: JWT_EXPIRES_IN }
     );
-    
+
     // Return user data (without password)
     const userData = {
       id: user.id,
@@ -543,14 +557,14 @@ app.post('/api/auth/login', async (req, res) => {
       phone: user.phone,
       created_at: user.created_at
     };
-    
+
     res.json({
       success: true,
       message: 'Login successful',
       user: userData,
       token
     });
-    
+
   } catch (error) {
     console.error('Error logging in user:', error);
     res.status(500).json({
@@ -564,13 +578,13 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/auth/profile', authenticateUser, async (req, res) => {
   try {
     const userId = req.user.id;
-    
+
     // Get user profile
     const user = await db.get('SELECT id, first_name, last_name, email, phone, created_at FROM users_auth WHERE id = ?', userId);
-    
+
     // Get user addresses
     const addresses = await db.all('SELECT * FROM user_addresses WHERE user_id = ? ORDER BY is_default DESC, created_at DESC', userId);
-    
+
     res.json({
       success: true,
       user: {
@@ -578,7 +592,7 @@ app.get('/api/auth/profile', authenticateUser, async (req, res) => {
         addresses
       }
     });
-    
+
   } catch (error) {
     console.error('Error fetching user profile:', error);
     res.status(500).json({
@@ -593,7 +607,7 @@ app.put('/api/auth/profile', authenticateUser, async (req, res) => {
   try {
     const userId = req.user.id;
     const { first_name, last_name, phone } = req.body;
-    
+
     // Validation
     if (!first_name || !last_name) {
       return res.status(400).json({
@@ -601,23 +615,23 @@ app.put('/api/auth/profile', authenticateUser, async (req, res) => {
         message: 'First name and last name are required'
       });
     }
-    
+
     // Update user profile
     await db.run(`
-      UPDATE users_auth 
+      UPDATE users_auth
       SET first_name = ?, last_name = ?, phone = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `, [first_name, last_name, phone || null, userId]);
-    
+
     // Get updated user
     const updatedUser = await db.get('SELECT id, first_name, last_name, email, phone, created_at, updated_at FROM users_auth WHERE id = ?', userId);
-    
+
     res.json({
       success: true,
       message: 'Profile updated successfully',
       user: updatedUser
     });
-    
+
   } catch (error) {
     console.error('Error updating user profile:', error);
     res.status(500).json({
@@ -777,7 +791,7 @@ app.post('/api/consultants', authenticateToken, requireRole('superadmin'), async
     // Ensure image path is correct
     let imagePath = image;
     if (imagePath && !imagePath.startsWith('/uploads/')) {
-      imagePath = '/uploads/' + imagePath.replace(/^\\+|^\/+/,'');
+      imagePath = '/uploads/' + imagePath.replace(/^\\+|^\/+/, '');
     }
     // Create consultant profile
     const result = await db.run(
@@ -1069,8 +1083,8 @@ app.get('/', (req, res) => {
 // Test endpoint for frontend connection
 app.get('/api/test', (req, res) => {
   console.log('Test endpoint called');
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     message: 'Backend API is working',
     timestamp: new Date().toISOString(),
     products_count: 0 // We'll update this dynamically
@@ -1079,12 +1093,26 @@ app.get('/api/test', (req, res) => {
 
 // Health check endpoint for CORS testing
 app.get('/api/health', (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.json({ 
-    status: 'healthy', 
+  res.json({
+    status: 'healthy',
     message: 'Backend is running and CORS is configured',
     timestamp: new Date().toISOString(),
-    cors: 'enabled'
+    cors: 'enabled',
+    allowedOrigins: CORS_ORIGINS,
+    requestOrigin: req.headers.origin || 'No origin header'
+  });
+});
+
+// CORS debug endpoint
+app.get('/api/cors-debug', (req, res) => {
+  res.json({
+    cors: {
+      enabled: true,
+      allowedOrigins: CORS_ORIGINS,
+      requestOrigin: req.headers.origin || 'No origin header',
+      requestHeaders: req.headers,
+      isOriginAllowed: req.headers.origin ? CORS_ORIGINS.includes(req.headers.origin) : 'No origin to check'
+    }
   });
 });
 
@@ -1113,7 +1141,7 @@ const blogStorage = multer.diskStorage({
   }
 });
 
-const blogUpload = multer({ 
+const blogUpload = multer({
   storage: blogStorage,
   fileFilter: (req, file, cb) => {
     // Allow only image files
@@ -1131,35 +1159,35 @@ const blogUpload = multer({
 // Blog validation middleware
 const validateBlog = (req, res, next) => {
   const { title, description, author, category } = req.body;
-  
+
   if (!title || !title.trim()) {
     return res.status(400).json({
       success: false,
       message: 'Title is required'
     });
   }
-  
+
   if (!description || !description.trim()) {
     return res.status(400).json({
       success: false,
       message: 'Description is required'
     });
   }
-  
+
   if (!author || !author.trim()) {
     return res.status(400).json({
       success: false,
       message: 'Author is required'
     });
   }
-  
+
   if (!category || !category.trim()) {
     return res.status(400).json({
       success: false,
       message: 'Category is required'
     });
   }
-  
+
   // Validate category values
   const validCategories = ['Therapy', 'Mental Health', 'Education', 'Support', 'Technology'];
   if (!validCategories.includes(category)) {
@@ -1168,7 +1196,7 @@ const validateBlog = (req, res, next) => {
       message: 'Category must be one of: Therapy, Mental Health, Education, Support, Technology'
     });
   }
-  
+
   // Validate status if provided
   const validStatuses = ['active', 'inactive', 'published', 'draft', 'pending', 'archived', 'live', 'scheduled', 'private', 'public', 'review', 'approved', 'rejected', 'trash', 'deleted'];
   if (req.body.status && !validStatuses.includes(req.body.status)) {
@@ -1177,7 +1205,7 @@ const validateBlog = (req, res, next) => {
       message: `Status must be one of: ${validStatuses.join(', ')}`
     });
   }
-  
+
   next();
 };
 
@@ -1186,27 +1214,27 @@ app.post('/api/blogs', blogUpload.single('thumbnail'), validateBlog, async (req,
   try {
     const { title, description, category, author, status } = req.body;
     const thumbnail = req.file ? `/uploads/blogs/${req.file.filename}` : null;
-    
+
     // Ensure status is valid, default to 'draft' if not provided or invalid
     const validStatuses = ['active', 'inactive', 'published', 'draft', 'pending', 'archived', 'live', 'scheduled', 'private', 'public', 'review', 'approved', 'rejected', 'trash', 'deleted'];
     const validStatus = (status && validStatuses.includes(status)) ? status : 'draft';
-    
+
     const result = await db.run(`
       INSERT INTO blogs (title, description, category, thumbnail, author, status, date)
       VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     `, [title.trim(), description.trim(), category, thumbnail, author.trim(), validStatus]);
-    
+
     const blogId = result.lastID;
-    
+
     // Fetch the created blog
     const newBlog = await db.get('SELECT * FROM blogs WHERE id = ?', blogId);
-    
+
     res.status(201).json({
       success: true,
       message: 'Blog created successfully',
       blog: newBlog
     });
-    
+
   } catch (error) {
     console.error('Error creating blog:', error);
     res.status(500).json({
@@ -1221,40 +1249,40 @@ app.get('/api/blogs', async (req, res) => {
   try {
     let sql = 'SELECT * FROM blogs WHERE 1=1';
     let params = [];
-    
+
     // Add filters
     if (req.query.category) {
       sql += ' AND LOWER(category) = LOWER(?)';
       params.push(req.query.category);
     }
-    
+
     if (req.query.status) {
       sql += ' AND status = ?';
       params.push(req.query.status);
     }
-    
+
     if (req.query.author) {
       sql += ' AND LOWER(author) LIKE LOWER(?)';
       params.push(`%${req.query.author}%`);
     }
-    
+
     // Add search functionality
     if (req.query.search) {
       sql += ' AND (LOWER(title) LIKE LOWER(?) OR LOWER(description) LIKE LOWER(?))';
       const searchTerm = `%${req.query.search}%`;
       params.push(searchTerm, searchTerm);
     }
-    
+
     sql += ' ORDER BY date DESC';
-    
+
     const blogs = await db.all(sql, params);
-    
+
     res.json({
       success: true,
       blogs: blogs,
       count: blogs.length
     });
-    
+
   } catch (error) {
     console.error('Error fetching blogs:', error);
     res.status(500).json({
@@ -1268,21 +1296,21 @@ app.get('/api/blogs', async (req, res) => {
 app.get('/api/blogs/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
+
     const blog = await db.get('SELECT * FROM blogs WHERE id = ?', id);
-    
+
     if (!blog) {
       return res.status(404).json({
         success: false,
         message: 'Blog not found'
       });
     }
-    
+
     res.json({
       success: true,
       blog: blog
     });
-    
+
   } catch (error) {
     console.error('Error fetching blog:', error);
     res.status(500).json({
@@ -1297,7 +1325,7 @@ app.put('/api/blogs/:id', blogUpload.single('thumbnail'), validateBlog, async (r
   try {
     const { id } = req.params;
     const { title, description, category, author, status } = req.body;
-    
+
     // Check if blog exists
     const existingBlog = await db.get('SELECT * FROM blogs WHERE id = ?', id);
     if (!existingBlog) {
@@ -1306,7 +1334,7 @@ app.put('/api/blogs/:id', blogUpload.single('thumbnail'), validateBlog, async (r
         message: 'Blog not found'
       });
     }
-    
+
     let thumbnail = existingBlog.thumbnail;
     if (req.file) {
       // Delete old thumbnail if it exists
@@ -1318,26 +1346,26 @@ app.put('/api/blogs/:id', blogUpload.single('thumbnail'), validateBlog, async (r
       }
       thumbnail = `/uploads/blogs/${req.file.filename}`;
     }
-    
+
     // Ensure status is valid, default to 'draft' if not provided or invalid
     const validStatuses = ['active', 'inactive', 'published', 'draft', 'pending', 'archived', 'live', 'scheduled', 'private', 'public', 'review', 'approved', 'rejected', 'trash', 'deleted'];
     const validStatus = (status && validStatuses.includes(status)) ? status : 'draft';
-    
+
     await db.run(`
-      UPDATE blogs 
+      UPDATE blogs
       SET title = ?, description = ?, category = ?, thumbnail = ?, author = ?, status = ?, date = CURRENT_TIMESTAMP
       WHERE id = ?
     `, [title.trim(), description.trim(), category, thumbnail, author.trim(), validStatus, id]);
-    
+
     // Fetch the updated blog
     const updatedBlog = await db.get('SELECT * FROM blogs WHERE id = ?', id);
-    
+
     res.json({
       success: true,
       message: 'Blog updated successfully',
       blog: updatedBlog
     });
-    
+
   } catch (error) {
     console.error('Error updating blog:', error);
     res.status(500).json({
@@ -1351,7 +1379,7 @@ app.put('/api/blogs/:id', blogUpload.single('thumbnail'), validateBlog, async (r
 app.delete('/api/blogs/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
+
     // Check if blog exists
     const existingBlog = await db.get('SELECT * FROM blogs WHERE id = ?', id);
     if (!existingBlog) {
@@ -1360,7 +1388,7 @@ app.delete('/api/blogs/:id', async (req, res) => {
         message: 'Blog not found'
       });
     }
-    
+
     // Delete thumbnail file if it exists
     if (existingBlog.thumbnail) {
       const oldThumbnailPath = path.join(process.cwd(), existingBlog.thumbnail);
@@ -1368,14 +1396,14 @@ app.delete('/api/blogs/:id', async (req, res) => {
         fs.unlinkSync(oldThumbnailPath);
       }
     }
-    
+
     await db.run('DELETE FROM blogs WHERE id = ?', id);
-    
+
     res.json({
       success: true,
       message: 'Blog deleted successfully'
     });
-    
+
   } catch (error) {
     console.error('Error deleting blog:', error);
     res.status(500).json({
@@ -1392,7 +1420,7 @@ app.post('/api/orders', authenticateUser, checkoutLimiter, async (req, res) => {
   try {
     const userId = req.user.id;
     const { items, deliveryAddress, paymentMethod } = req.body;
-    
+
     // Validation
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
@@ -1400,21 +1428,21 @@ app.post('/api/orders', authenticateUser, checkoutLimiter, async (req, res) => {
         message: 'Order items are required'
       });
     }
-    
+
     if (!deliveryAddress || !paymentMethod) {
       return res.status(400).json({
         success: false,
         message: 'Delivery address and payment method are required'
       });
     }
-    
+
     // Calculate total amount and validate inventory
     let totalAmount = 0;
     const orderItems = [];
-    
+
     for (const item of items) {
       const { productId, quantity } = item;
-      
+
       // Get product details
       const product = await db.get('SELECT * FROM products WHERE id = ?', productId);
       if (!product) {
@@ -1423,7 +1451,7 @@ app.post('/api/orders', authenticateUser, checkoutLimiter, async (req, res) => {
           message: `Product with ID ${productId} not found`
         });
       }
-      
+
       // Check inventory
       const inventory = await db.get('SELECT available_quantity FROM product_inventory WHERE product_id = ?', productId);
       if (!inventory || inventory.available_quantity < quantity) {
@@ -1432,10 +1460,10 @@ app.post('/api/orders', authenticateUser, checkoutLimiter, async (req, res) => {
           message: `Insufficient inventory for product: ${product.title || product.name}`
         });
       }
-      
+
       const itemTotal = (product.price || 0) * quantity;
       totalAmount += itemTotal;
-      
+
       orderItems.push({
         productId,
         productType: product.product_type,
@@ -1445,43 +1473,43 @@ app.post('/api/orders', authenticateUser, checkoutLimiter, async (req, res) => {
         totalPrice: itemTotal
       });
     }
-    
+
     // Generate order number
     const orderNumber = `ORD-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-    
+
     // Create order
     const orderResult = await db.run(`
       INSERT INTO orders_new (user_id, order_number, total_amount, payment_method, delivery_address)
       VALUES (?, ?, ?, ?, ?)
     `, [userId, orderNumber, totalAmount, paymentMethod, JSON.stringify(deliveryAddress)]);
-    
+
     const orderId = orderResult.lastID;
-    
+
     // Create order items
     for (const item of orderItems) {
       await db.run(`
         INSERT INTO order_items_new (order_id, product_id, product_type, product_name, quantity, unit_price, total_price)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `, [orderId, item.productId, item.productType, item.productName, item.quantity, item.unitPrice, item.totalPrice]);
-      
+
       // Update inventory
       await db.run(`
-        UPDATE product_inventory 
+        UPDATE product_inventory
         SET available_quantity = available_quantity - ?, updated_at = CURRENT_TIMESTAMP
         WHERE product_id = ?
       `, [item.quantity, item.productId]);
     }
-    
+
     // Create initial status history
     await db.run(`
       INSERT INTO order_status_history (order_id, status, notes)
       VALUES (?, ?, ?)
     `, [orderId, 'pending', 'Order created successfully']);
-    
+
     // Get created order with items
     const order = await db.get('SELECT * FROM orders_new WHERE id = ?', orderId);
     const orderItemsData = await db.all('SELECT * FROM order_items_new WHERE order_id = ?', orderId);
-    
+
     res.status(201).json({
       success: true,
       message: 'Order created successfully',
@@ -1490,7 +1518,7 @@ app.post('/api/orders', authenticateUser, checkoutLimiter, async (req, res) => {
         items: orderItemsData
       }
     });
-    
+
   } catch (error) {
     console.error('Error creating order:', error);
     res.status(500).json({
@@ -1505,7 +1533,7 @@ app.get('/api/orders/user/:userId', authenticateUser, async (req, res) => {
   try {
     const { userId } = req.params;
     const authenticatedUserId = req.user.id;
-    
+
     // Ensure user can only access their own orders
     if (parseInt(userId) !== authenticatedUserId) {
       return res.status(403).json({
@@ -1513,9 +1541,9 @@ app.get('/api/orders/user/:userId', authenticateUser, async (req, res) => {
         message: 'Access denied'
       });
     }
-    
+
     const orders = await db.all(`
-      SELECT o.*, 
+      SELECT o.*,
              COUNT(oi.id) as items_count
       FROM orders_new o
       LEFT JOIN order_items_new oi ON o.id = oi.order_id
@@ -1523,12 +1551,12 @@ app.get('/api/orders/user/:userId', authenticateUser, async (req, res) => {
       GROUP BY o.id
       ORDER BY o.created_at DESC
     `, [userId]);
-    
+
     res.json({
       success: true,
       orders
     });
-    
+
   } catch (error) {
     console.error('Error fetching user orders:', error);
     res.status(500).json({
@@ -1543,7 +1571,7 @@ app.get('/api/orders/:orderId', authenticateUser, async (req, res) => {
   try {
     const { orderId } = req.params;
     const userId = req.user.id;
-    
+
     // Get order
     const order = await db.get('SELECT * FROM orders_new WHERE id = ? AND user_id = ?', [orderId, userId]);
     if (!order) {
@@ -1552,13 +1580,13 @@ app.get('/api/orders/:orderId', authenticateUser, async (req, res) => {
         message: 'Order not found'
       });
     }
-    
+
     // Get order items
     const orderItems = await db.all('SELECT * FROM order_items_new WHERE order_id = ?', orderId);
-    
+
     // Get order status history
     const statusHistory = await db.all('SELECT * FROM order_status_history WHERE order_id = ? ORDER BY created_at ASC', orderId);
-    
+
     res.json({
       success: true,
       order: {
@@ -1567,7 +1595,7 @@ app.get('/api/orders/:orderId', authenticateUser, async (req, res) => {
         statusHistory
       }
     });
-    
+
   } catch (error) {
     console.error('Error fetching order details:', error);
     res.status(500).json({
@@ -1583,7 +1611,7 @@ app.put('/api/orders/:orderId/status', authenticateUser, async (req, res) => {
     const { orderId } = req.params;
     const { status, notes } = req.body;
     const userId = req.user.id;
-    
+
     // Validation
     const validStatuses = ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled'];
     if (!validStatuses.includes(status)) {
@@ -1592,7 +1620,7 @@ app.put('/api/orders/:orderId/status', authenticateUser, async (req, res) => {
         message: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
       });
     }
-    
+
     // Get order
     const order = await db.get('SELECT * FROM orders_new WHERE id = ? AND user_id = ?', [orderId, userId]);
     if (!order) {
@@ -1601,25 +1629,25 @@ app.put('/api/orders/:orderId/status', authenticateUser, async (req, res) => {
         message: 'Order not found'
       });
     }
-    
+
     // Update order status
     await db.run(`
-      UPDATE orders_new 
+      UPDATE orders_new
       SET status = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `, [orderId, status]);
-    
+
     // Add status history
     await db.run(`
       INSERT INTO order_status_history (order_id, status, notes)
       VALUES (?, ?, ?)
     `, [orderId, status, notes || null]);
-    
+
     res.json({
       success: true,
       message: 'Order status updated successfully'
     });
-    
+
   } catch (error) {
     console.error('Error updating order status:', error);
     res.status(500).json({
@@ -1635,7 +1663,7 @@ app.put('/api/orders/:orderId/status', authenticateUser, async (req, res) => {
 app.post('/api/payments/initialize', authenticateUser, async (req, res) => {
   try {
     const { orderId, amount, paymentMethod, currency = 'INR' } = req.body;
-    
+
     // Validation
     if (!orderId || !amount || !paymentMethod) {
       return res.status(400).json({
@@ -1643,7 +1671,7 @@ app.post('/api/payments/initialize', authenticateUser, async (req, res) => {
         message: 'Order ID, amount, and payment method are required'
       });
     }
-    
+
     // Verify order exists and belongs to user
     const order = await db.get('SELECT * FROM orders_new WHERE id = ? AND user_id = ?', [orderId, req.user.id]);
     if (!order) {
@@ -1652,7 +1680,7 @@ app.post('/api/payments/initialize', authenticateUser, async (req, res) => {
         message: 'Order not found'
       });
     }
-    
+
     // Verify amount matches order total
     if (parseFloat(amount) !== parseFloat(order.total_amount)) {
       return res.status(400).json({
@@ -1660,18 +1688,18 @@ app.post('/api/payments/initialize', authenticateUser, async (req, res) => {
         message: 'Payment amount does not match order total'
       });
     }
-    
+
     // Generate transaction ID
     const transactionId = `TXN-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
-    
+
     // Create payment record
     const paymentResult = await db.run(`
       INSERT INTO payments (order_id, payment_method, amount, currency, transaction_id)
       VALUES (?, ?, ?, ?, ?)
     `, [orderId, paymentMethod, amount, currency, transactionId]);
-    
+
     const paymentId = paymentResult.lastID;
-    
+
     // Simulate payment gateway response (replace with actual gateway integration)
     const gatewayResponse = {
       payment_id: paymentId,
@@ -1680,14 +1708,14 @@ app.post('/api/payments/initialize', authenticateUser, async (req, res) => {
       gateway: 'test_gateway',
       timestamp: new Date().toISOString()
     };
-    
+
     // Update payment with gateway response
     await db.run(`
-      UPDATE payments 
+      UPDATE payments
       SET gateway_response = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `, [JSON.stringify(gatewayResponse), paymentId]);
-    
+
     res.json({
       success: true,
       message: 'Payment initialized successfully',
@@ -1700,7 +1728,7 @@ app.post('/api/payments/initialize', authenticateUser, async (req, res) => {
         gatewayResponse
       }
     });
-    
+
   } catch (error) {
     console.error('Error initializing payment:', error);
     res.status(500).json({
@@ -1714,20 +1742,20 @@ app.post('/api/payments/initialize', authenticateUser, async (req, res) => {
 app.post('/api/payments/webhook', async (req, res) => {
   try {
     const { transactionId, status, gatewayData } = req.body;
-    
+
     // In production, verify webhook signature here
     // const signature = req.headers['x-webhook-signature'];
     // if (!verifyWebhookSignature(signature, req.body)) {
     //   return res.status(401).json({ error: 'Invalid signature' });
     // }
-    
+
     if (!transactionId || !status) {
       return res.status(400).json({
         success: false,
         message: 'Transaction ID and status are required'
       });
     }
-    
+
     // Find payment by transaction ID
     const payment = await db.get('SELECT * FROM payments WHERE transaction_id = ?', transactionId);
     if (!payment) {
@@ -1736,24 +1764,24 @@ app.post('/api/payments/webhook', async (req, res) => {
         message: 'Payment not found'
       });
     }
-    
+
     // Update payment status
     await db.run(`
-      UPDATE payments 
+      UPDATE payments
       SET status = ?, gateway_response = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `, [status, JSON.stringify(gatewayData || {}), payment.id]);
-    
+
     // Update order payment status
-    const orderStatus = status === 'completed' ? 'paid' : 
-                       status === 'failed' ? 'failed' : 'pending';
-    
+    const orderStatus = status === 'completed' ? 'paid' :
+      status === 'failed' ? 'failed' : 'pending';
+
     await db.run(`
-      UPDATE orders_new 
+      UPDATE orders_new
       SET payment_status = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `, [orderStatus, payment.order_id]);
-    
+
     // Add order status history
     if (status === 'completed') {
       await db.run(`
@@ -1761,12 +1789,12 @@ app.post('/api/payments/webhook', async (req, res) => {
         VALUES (?, ?, ?)
       `, [payment.order_id, 'confirmed', 'Payment completed successfully']);
     }
-    
+
     res.json({
       success: true,
       message: 'Payment status updated successfully'
     });
-    
+
   } catch (error) {
     console.error('Error processing payment webhook:', error);
     res.status(500).json({
@@ -1780,26 +1808,26 @@ app.post('/api/payments/webhook', async (req, res) => {
 app.get('/api/payments/:paymentId/status', authenticateUser, async (req, res) => {
   try {
     const { paymentId } = req.params;
-    
+
     const payment = await db.get(`
-      SELECT p.*, o.order_number, o.total_amount 
+      SELECT p.*, o.order_number, o.total_amount
       FROM payments p
       JOIN orders_new o ON p.order_id = o.id
       WHERE p.id = ? AND o.user_id = ?
     `, [paymentId, req.user.id]);
-    
+
     if (!payment) {
       return res.status(404).json({
         success: false,
         message: 'Payment not found'
       });
     }
-    
+
     res.json({
       success: true,
       payment
     });
-    
+
   } catch (error) {
     console.error('Error fetching payment status:', error);
     res.status(500).json({
@@ -1815,14 +1843,14 @@ app.get('/api/payments/:paymentId/status', authenticateUser, async (req, res) =>
 app.get('/api/inventory/check', async (req, res) => {
   try {
     const { productId, quantity = 1 } = req.query;
-    
+
     if (!productId) {
       return res.status(400).json({
         success: false,
         message: 'Product ID is required'
       });
     }
-    
+
     // Get product details
     const product = await db.get('SELECT * FROM products WHERE id = ?', productId);
     if (!product) {
@@ -1831,10 +1859,10 @@ app.get('/api/inventory/check', async (req, res) => {
         message: 'Product not found'
       });
     }
-    
+
     // Get inventory
     const inventory = await db.get('SELECT * FROM product_inventory WHERE product_id = ?', productId);
-    
+
     if (!inventory) {
       return res.json({
         success: true,
@@ -1847,11 +1875,11 @@ app.get('/api/inventory/check', async (req, res) => {
         }
       });
     }
-    
+
     const available = inventory.available_quantity >= quantity;
     const stockLevel = inventory.available_quantity;
     const lowStock = stockLevel <= inventory.min_stock_level;
-    
+
     res.json({
       success: true,
       available,
@@ -1869,7 +1897,7 @@ app.get('/api/inventory/check', async (req, res) => {
         minStock: inventory.min_stock_level
       }
     });
-    
+
   } catch (error) {
     console.error('Error checking inventory:', error);
     res.status(500).json({
@@ -1883,7 +1911,7 @@ app.get('/api/inventory/check', async (req, res) => {
 app.put('/api/inventory/update', authenticateUser, async (req, res) => {
   try {
     const { productId, quantity, operation } = req.body;
-    
+
     // Validation
     if (!productId || quantity === undefined || !operation) {
       return res.status(400).json({
@@ -1891,7 +1919,7 @@ app.put('/api/inventory/update', authenticateUser, async (req, res) => {
         message: 'Product ID, quantity, and operation are required'
       });
     }
-    
+
     const validOperations = ['add', 'subtract', 'set'];
     if (!validOperations.includes(operation)) {
       return res.status(400).json({
@@ -1899,17 +1927,17 @@ app.put('/api/inventory/update', authenticateUser, async (req, res) => {
         message: 'Operation must be one of: add, subtract, set'
       });
     }
-    
+
     // Get current inventory
     let inventory = await db.get('SELECT * FROM product_inventory WHERE product_id = ?', productId);
-    
+
     if (!inventory) {
       // Create inventory record if it doesn't exist
       const result = await db.run(`
         INSERT INTO product_inventory (product_id, product_type, available_quantity, reserved_quantity, min_stock_level)
         VALUES (?, ?, 0, 0, 5)
       `, [productId, 'product']);
-      
+
       inventory = {
         id: result.lastID,
         product_id: productId,
@@ -1918,7 +1946,7 @@ app.put('/api/inventory/update', authenticateUser, async (req, res) => {
         min_stock_level: 5
       };
     }
-    
+
     let newQuantity;
     switch (operation) {
       case 'add':
@@ -1931,17 +1959,17 @@ app.put('/api/inventory/update', authenticateUser, async (req, res) => {
         newQuantity = parseInt(quantity);
         break;
     }
-    
+
     // Update inventory
     await db.run(`
-      UPDATE product_inventory 
+      UPDATE product_inventory
       SET available_quantity = ?, updated_at = CURRENT_TIMESTAMP
       WHERE product_id = ?
     `, [newQuantity, productId]);
-    
+
     // Get updated inventory
     const updatedInventory = await db.get('SELECT * FROM product_inventory WHERE product_id = ?', productId);
-    
+
     res.json({
       success: true,
       message: `Inventory ${operation}ed successfully`,
@@ -1951,7 +1979,7 @@ app.put('/api/inventory/update', authenticateUser, async (req, res) => {
       previousQuantity: inventory.available_quantity,
       newQuantity
     });
-    
+
   } catch (error) {
     console.error('Error updating inventory:', error);
     res.status(500).json({
@@ -1968,14 +1996,14 @@ app.post('/api/notifications/email/order-confirmation', authenticateUser, async 
   try {
     const { orderId } = req.body;
     const userId = req.user.id;
-    
+
     if (!orderId) {
       return res.status(400).json({
         success: false,
         message: 'Order ID is required'
       });
     }
-    
+
     // Get order details
     const order = await db.get(`
       SELECT o.*, u.first_name, u.last_name, u.email
@@ -1983,17 +2011,17 @@ app.post('/api/notifications/email/order-confirmation', authenticateUser, async 
       JOIN users_auth u ON o.user_id = u.id
       WHERE o.id = ? AND o.user_id = ?
     `, [orderId, userId]);
-    
+
     if (!order) {
       return res.status(404).json({
         success: false,
         message: 'Order not found'
       });
     }
-    
+
     // Get order items
     const orderItems = await db.all('SELECT * FROM order_items_new WHERE order_id = ?', orderId);
-    
+
     // Simulate email sending (replace with actual SMTP integration)
     const emailData = {
       to: order.email,
@@ -2008,18 +2036,18 @@ app.post('/api/notifications/email/order-confirmation', authenticateUser, async 
         deliveryAddress: JSON.parse(order.delivery_address)
       }
     };
-    
+
     // In production, send actual email here
     // await sendEmail(emailData);
-    
+
     console.log('Order confirmation email would be sent:', emailData);
-    
+
     res.json({
       success: true,
       message: 'Order confirmation email sent successfully',
       emailData
     });
-    
+
   } catch (error) {
     console.error('Error sending order confirmation email:', error);
     res.status(500).json({
@@ -2034,14 +2062,14 @@ app.post('/api/notifications/email/shipping-update', authenticateUser, async (re
   try {
     const { orderId, status, trackingNumber, estimatedDelivery } = req.body;
     const userId = req.user.id;
-    
+
     if (!orderId || !status) {
       return res.status(400).json({
         success: false,
         message: 'Order ID and status are required'
       });
     }
-    
+
     // Get order details
     const order = await db.get(`
       SELECT o.*, u.first_name, u.last_name, u.email
@@ -2049,14 +2077,14 @@ app.post('/api/notifications/email/shipping-update', authenticateUser, async (re
       JOIN users_auth u ON o.user_id = u.id
       WHERE o.id = ? AND o.user_id = ?
     `, [orderId, userId]);
-    
+
     if (!order) {
       return res.status(404).json({
         success: false,
         message: 'Order not found'
       });
     }
-    
+
     // Simulate email sending (replace with actual SMTP integration)
     const emailData = {
       to: order.email,
@@ -2071,18 +2099,18 @@ app.post('/api/notifications/email/shipping-update', authenticateUser, async (re
         orderDate: order.created_at
       }
     };
-    
+
     // In production, send actual email here
     // await sendEmail(emailData);
-    
+
     console.log('Shipping update email would be sent:', emailData);
-    
+
     res.json({
       success: true,
       message: 'Shipping update email sent successfully',
       emailData
     });
-    
+
   } catch (error) {
     console.error('Error sending shipping update email:', error);
     res.status(500).json({
@@ -2099,7 +2127,7 @@ app.post('/api/auth/addresses', authenticateUser, async (req, res) => {
   try {
     const userId = req.user.id;
     const { addressLine1, city, state, zipCode, country = 'India', isDefault = false } = req.body;
-    
+
     // Validation
     if (!addressLine1 || !city || !state || !zipCode) {
       return res.status(400).json({
@@ -2107,29 +2135,29 @@ app.post('/api/auth/addresses', authenticateUser, async (req, res) => {
         message: 'Address line 1, city, state, and zip code are required'
       });
     }
-    
+
     // If this is the first address or marked as default, unset other defaults
     if (isDefault) {
       await db.run('UPDATE user_addresses SET is_default = 0 WHERE user_id = ?', userId);
     }
-    
+
     // Create address
     const result = await db.run(`
       INSERT INTO user_addresses (user_id, address_line1, city, state, zip_code, country, is_default)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `, [userId, addressLine1, city, state, zipCode, country, isDefault ? 1 : 0]);
-    
+
     const addressId = result.lastID;
-    
+
     // Get created address
     const newAddress = await db.get('SELECT * FROM user_addresses WHERE id = ?', addressId);
-    
+
     res.status(201).json({
       success: true,
       message: 'Address added successfully',
       address: newAddress
     });
-    
+
   } catch (error) {
     console.error('Error adding address:', error);
     res.status(500).json({
@@ -2143,18 +2171,18 @@ app.post('/api/auth/addresses', authenticateUser, async (req, res) => {
 app.get('/api/auth/addresses', authenticateUser, async (req, res) => {
   try {
     const userId = req.user.id;
-    
+
     const addresses = await db.all(`
-      SELECT * FROM user_addresses 
-      WHERE user_id = ? 
+      SELECT * FROM user_addresses
+      WHERE user_id = ?
       ORDER BY is_default DESC, created_at DESC
     `, [userId]);
-    
+
     res.json({
       success: true,
       addresses
     });
-    
+
   } catch (error) {
     console.error('Error fetching addresses:', error);
     res.status(500).json({
@@ -2170,7 +2198,7 @@ app.put('/api/auth/addresses/:addressId', authenticateUser, async (req, res) => 
     const { addressId } = req.params;
     const userId = req.user.id;
     const { addressLine1, city, state, zipCode, country, isDefault } = req.body;
-    
+
     // Check if address exists and belongs to user
     const existingAddress = await db.get('SELECT * FROM user_addresses WHERE id = ? AND user_id = ?', [addressId, userId]);
     if (!existingAddress) {
@@ -2179,28 +2207,28 @@ app.put('/api/auth/addresses/:addressId', authenticateUser, async (req, res) => 
         message: 'Address not found'
       });
     }
-    
+
     // If setting as default, unset other defaults
     if (isDefault) {
       await db.run('UPDATE user_addresses SET is_default = 0 WHERE user_id = ?', userId);
     }
-    
+
     // Update address
     await db.run(`
-      UPDATE user_addresses 
+      UPDATE user_addresses
       SET address_line1 = ?, city = ?, state = ?, zip_code = ?, country = ?, is_default = ?
       WHERE id = ? AND user_id = ?
     `, [addressLine1, city, state, zipCode, country, isDefault ? 1 : 0, addressId, userId]);
-    
+
     // Get updated address
     const updatedAddress = await db.get('SELECT * FROM user_addresses WHERE id = ?', addressId);
-    
+
     res.json({
       success: true,
       message: 'Address updated successfully',
       address: updatedAddress
     });
-    
+
   } catch (error) {
     console.error('Error updating address:', error);
     res.status(500).json({
@@ -2215,7 +2243,7 @@ app.delete('/api/auth/addresses/:addressId', authenticateUser, async (req, res) 
   try {
     const { addressId } = req.params;
     const userId = req.user.id;
-    
+
     // Check if address exists and belongs to user
     const existingAddress = await db.get('SELECT * FROM user_addresses WHERE id = ? AND user_id = ?', [addressId, userId]);
     if (!existingAddress) {
@@ -2224,15 +2252,15 @@ app.delete('/api/auth/addresses/:addressId', authenticateUser, async (req, res) 
         message: 'Address not found'
       });
     }
-    
+
     // Delete address
     await db.run('DELETE FROM user_addresses WHERE id = ? AND user_id = ?', [addressId, userId]);
-    
+
     res.json({
       success: true,
       message: 'Address deleted successfully'
     });
-    
+
   } catch (error) {
     console.error('Error deleting address:', error);
     res.status(500).json({
@@ -2246,7 +2274,7 @@ app.delete('/api/auth/addresses/:addressId', authenticateUser, async (req, res) 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, async () => {
   console.log(`Backend API running on http://localhost:${PORT}`);
-  
+
   try {
     await setupDatabase();
     console.log('Database initialized.');
@@ -2344,7 +2372,7 @@ app.get('/api/consultants/public', async (req, res) => {
 });
 
 // --- Products API with File Uploads ---
-// 
+//
 // POST /api/products - Create a new product
 // - Content-Type: multipart/form-data
 // - Supports 4 product types: course, ebook, app, gadget
@@ -2359,29 +2387,29 @@ async function ensureProductsTableV2() {
   try {
     // Check if products table exists and has the right structure
     const tableExists = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='products'");
-    
+
     if (tableExists) {
       // Table exists, check if it has the right columns
       const columns = await db.all("PRAGMA table_info(products)");
       const columnNames = columns.map(col => col.name);
-      
+
       // Check if we have all required columns including new course fields
       const requiredColumns = [
-        'product_type', 'title', 'name', 'description', 'price', 'video_url', 
-        'thumbnail', 'author', 'pdf_file', 'product_image', 'purchase_link', 
+        'product_type', 'title', 'name', 'description', 'price', 'video_url',
+        'thumbnail', 'author', 'pdf_file', 'product_image', 'purchase_link',
         'download_link', 'icon', 'status', 'featured', 'created_at',
         // New course-specific fields
         'subtitle', 'instructor_name', 'instructor_title', 'instructor_bio',
         'instructor_image', 'duration', 'total_lectures', 'language', 'level',
         'rating', 'total_ratings', 'enrolled_students'
       ];
-      
+
       const missingColumns = requiredColumns.filter(col => !columnNames.includes(col));
-      
+
       if (missingColumns.length > 0) {
         console.log('Products table missing columns:', missingColumns);
         console.log('Adding missing columns to products table...');
-        
+
         // Add missing columns one by one
         for (const col of missingColumns) {
           let columnType = 'TEXT';
@@ -2392,7 +2420,7 @@ async function ensureProductsTableV2() {
           } else if (col === 'level') {
             columnType = 'TEXT DEFAULT "Beginner"';
           }
-          
+
           try {
             await db.exec(`ALTER TABLE products ADD COLUMN ${col} ${columnType}`);
             console.log(`Added column: ${col}`);
@@ -2410,7 +2438,7 @@ async function ensureProductsTableV2() {
       }
     } else {
       // Table doesn't exist, create it with all fields
-  await db.exec(`
+      await db.exec(`
         CREATE TABLE products (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
           product_type TEXT NOT NULL,
@@ -2446,31 +2474,31 @@ async function ensureProductsTableV2() {
   `);
       console.log('Products table created with complete schema including course fields');
     }
-    
+
     // Create course-related tables
     await ensureCourseTables();
-    
+
     // Ensure cart tables are also created
     try {
       await ensureCartTables();
     } catch (error) {
       console.error('Error ensuring cart tables:', error);
     }
-    
+
     // Ensure blogs table exists
     try {
       await ensureBlogsTable();
     } catch (error) {
       console.error('Error ensuring blogs table:', error);
     }
-    
+
     // Ensure e-commerce tables exist
     try {
       await ensureEcommerceTables();
     } catch (error) {
       console.error('Error ensuring e-commerce tables:', error);
     }
-    
+
   } catch (error) {
     console.error('Error ensuring products table:', error);
     throw error;
@@ -2491,7 +2519,7 @@ async function ensureCourseTables() {
         FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
       );
     `);
-    
+
     // Requirements Table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS requirements (
@@ -2503,7 +2531,7 @@ async function ensureCourseTables() {
         FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
       );
     `);
-    
+
     // Course Sections Table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS course_sections (
@@ -2517,7 +2545,7 @@ async function ensureCourseTables() {
         FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
       );
     `);
-    
+
     // Course Lectures Table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS course_lectures (
@@ -2529,7 +2557,7 @@ async function ensureCourseTables() {
         FOREIGN KEY(section_id) REFERENCES course_sections(id) ON DELETE CASCADE
       );
     `);
-    
+
     console.log('Course-related tables ensured');
   } catch (error) {
     console.error('Error ensuring course tables:', error);
@@ -2551,7 +2579,7 @@ async function ensureCartTables() {
         FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
       )
     `);
-    
+
     // Cart items table for better structure
     await db.exec(`
       CREATE TABLE IF NOT EXISTS cart_items (
@@ -2564,7 +2592,7 @@ async function ensureCartTables() {
         FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
       )
     `);
-    
+
     // Orders table for checkout
     await db.exec(`
       CREATE TABLE IF NOT EXISTS orders (
@@ -2579,7 +2607,7 @@ async function ensureCartTables() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    
+
     // Order items table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS order_items (
@@ -2592,7 +2620,7 @@ async function ensureCartTables() {
         FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
       )
     `);
-    
+
     console.log('Cart tables ensured successfully');
   } catch (error) {
     console.error('Error creating cart tables:', error);
@@ -2605,12 +2633,12 @@ async function ensureBlogsTable() {
   try {
     // Check if blogs table exists
     const tableExists = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='blogs'");
-    
+
     if (tableExists) {
       console.log('Blogs table already exists');
       return;
     }
-    
+
     // Create blogs table
     await db.exec(`
       CREATE TABLE blogs (
@@ -2624,7 +2652,7 @@ async function ensureBlogsTable() {
         status TEXT CHECK(status IN ('active', 'inactive', 'published', 'draft', 'pending', 'archived', 'live', 'scheduled', 'private', 'public', 'review', 'approved', 'rejected', 'trash', 'deleted')) NOT NULL DEFAULT 'draft'
       );
     `);
-    
+
     console.log('Blogs table created successfully');
   } catch (error) {
     console.error('Error creating blogs table:', error);
@@ -2648,7 +2676,7 @@ async function ensureEcommerceTables() {
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    
+
     // Create user addresses table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS user_addresses (
@@ -2664,7 +2692,7 @@ async function ensureEcommerceTables() {
         FOREIGN KEY(user_id) REFERENCES users_auth(id) ON DELETE CASCADE
       );
     `);
-    
+
     // Create orders table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS orders_new (
@@ -2681,7 +2709,7 @@ async function ensureEcommerceTables() {
         FOREIGN KEY(user_id) REFERENCES users_auth(id) ON DELETE CASCADE
       );
     `);
-    
+
     // Create order items table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS order_items_new (
@@ -2697,7 +2725,7 @@ async function ensureEcommerceTables() {
         FOREIGN KEY(order_id) REFERENCES orders_new(id) ON DELETE CASCADE
       );
     `);
-    
+
     // Create order status history table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS order_status_history (
@@ -2709,7 +2737,7 @@ async function ensureEcommerceTables() {
         FOREIGN KEY(order_id) REFERENCES orders_new(id) ON DELETE CASCADE
       );
     `);
-    
+
     // Create payments table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS payments (
@@ -2726,7 +2754,7 @@ async function ensureEcommerceTables() {
         FOREIGN KEY(order_id) REFERENCES orders_new(id) ON DELETE CASCADE
       );
     `);
-    
+
     // Create product inventory table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS product_inventory (
@@ -2741,7 +2769,7 @@ async function ensureEcommerceTables() {
         FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
       );
     `);
-    
+
     // Create indexes for performance
     await db.exec(`
       CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders_new(user_id);
@@ -2751,7 +2779,7 @@ async function ensureEcommerceTables() {
       CREATE INDEX IF NOT EXISTS idx_payments_order_id ON payments(order_id);
       CREATE INDEX IF NOT EXISTS idx_user_addresses_user_id ON user_addresses(user_id);
     `);
-    
+
     console.log('E-commerce tables created successfully');
   } catch (error) {
     console.error('Error creating e-commerce tables:', error);
@@ -2763,7 +2791,7 @@ async function ensureEcommerceTables() {
 async function createLearningObjectives(productId, objectives) {
   try {
     if (!Array.isArray(objectives) || objectives.length === 0) return;
-    
+
     for (let i = 0; i < objectives.length; i++) {
       const objective = objectives[i];
       if (objective && objective.trim()) {
@@ -2782,7 +2810,7 @@ async function createLearningObjectives(productId, objectives) {
 async function createRequirements(productId, requirements) {
   try {
     if (!Array.isArray(requirements) || requirements.length === 0) return;
-    
+
     for (let i = 0; i < requirements.length; i++) {
       const requirement = requirements[i];
       if (requirement && requirement.trim()) {
@@ -2801,7 +2829,7 @@ async function createRequirements(productId, requirements) {
 async function createCourseContent(productId, content) {
   try {
     if (!Array.isArray(content) || content.length === 0) return;
-    
+
     for (let i = 0; i < content.length; i++) {
       const section = content[i];
       if (section && section.section_name && section.lectures) {
@@ -2810,9 +2838,9 @@ async function createCourseContent(productId, content) {
           'INSERT INTO course_sections (product_id, section_name, lectures_count, duration, order_index) VALUES (?, ?, ?, ?, ?)',
           productId, section.section_name, section.lectures.length, section.duration || '', i
         );
-        
+
         const sectionId = sectionResult.lastID;
-        
+
         // Create lectures for this section
         for (let j = 0; j < section.lectures.length; j++) {
           const lecture = section.lectures[j];
@@ -2861,7 +2889,7 @@ async function getCourseContent(productId) {
       'SELECT * FROM course_sections WHERE product_id = ? ORDER BY order_index ASC',
       productId
     );
-    
+
     const content = [];
     for (const section of sections) {
       const lectures = await db.all(
@@ -2873,7 +2901,7 @@ async function getCourseContent(productId) {
         lectures: lectures
       });
     }
-    
+
     return content;
   } catch (error) {
     console.error('Error getting course content:', error);
@@ -2903,12 +2931,12 @@ async function deleteCourseContent(productId) {
   try {
     // Get all sections for this product
     const sections = await db.all('SELECT id FROM course_sections WHERE product_id = ?', productId);
-    
+
     // Delete lectures for each section
     for (const section of sections) {
       await db.run('DELETE FROM course_lectures WHERE section_id = ?', section.id);
     }
-    
+
     // Delete sections
     await db.run('DELETE FROM course_sections WHERE product_id = ?', productId);
   } catch (error) {
@@ -2966,7 +2994,7 @@ const fileFilter = (req, file, cb) => {
   }
 };
 
-const productUpload = multer({ 
+const productUpload = multer({
   storage: productStorage,
   fileFilter: fileFilter,
   limits: {
@@ -3015,21 +3043,21 @@ app.post('/api/products', productUpload.fields([
   // Get product type and validate required fields
   // Support multiple possible field names for product type
   let productType = data.productType || data.product_type || data.type || data.productType;
-  
+
   // Clean and normalize the product type
   if (productType) {
     productType = productType.toString().toLowerCase().trim();
   }
-  
+
   // Debug logging
   console.log('Received form data:', Object.keys(data));
   console.log('Product type received (raw):', data.productType || data.product_type || data.type);
   console.log('Product type received (cleaned):', productType);
   console.log('All form fields:', data);
-  
+
   if (!productType) {
-    return res.status(400).json({ 
-      success: false, 
+    return res.status(400).json({
+      success: false,
       message: 'Product type is required. Please send either "productType", "product_type", or "type" field.',
       receivedFields: Object.keys(data),
       example: {
@@ -3046,43 +3074,43 @@ app.post('/api/products', productUpload.fields([
 
   // Normalize product type for flexible matching
   const normalizedType = productType.replace(/[^a-z]/g, ''); // Remove all non-letters
-  
+
   if (normalizedType === 'course') {
     // Basic required fields
     if (!data.title || !data.description || !files.thumbnail) {
       validationError = 'Course requires: title, description, and thumbnail';
     }
-    
+
     // Validate title length (3-255 characters)
     if (data.title && (data.title.length < 3 || data.title.length > 255)) {
       validationError = 'Title must be between 3 and 255 characters';
     }
-    
+
     // Validate subtitle length (10-500 characters)
     if (data.subtitle && (data.subtitle.length < 10 || data.subtitle.length > 500)) {
       validationError = 'Subtitle must be between 10 and 500 characters';
     }
-    
+
     // Validate description length (minimum 20 characters)
     if (data.description && data.description.length < 20) {
       validationError = 'Description must be at least 20 characters long';
     }
-    
+
     // Validate price (optional, but if provided must be valid)
     if (data.price && data.price !== 'Free' && isNaN(parseFloat(data.price))) {
       validationError = 'Price must be "Free" or a valid number';
     }
-    
+
     // Validate learning objectives (optional for now, max 20 items)
     if (data.learning_objectives && (!Array.isArray(data.learning_objectives) || data.learning_objectives.length > 20)) {
       validationError = 'Learning objectives must be an array with maximum 20 items';
     }
-    
+
     // Validate requirements (optional, max 20 items)
     if (data.requirements && (!Array.isArray(data.requirements) || data.requirements.length > 20)) {
       validationError = 'Requirements must be an array with maximum 20 items';
     }
-    
+
     // Validate course content (optional, max 50 sections)
     if (data.course_content && (!Array.isArray(data.course_content) || data.course_content.length > 50)) {
       validationError = 'Course content must be an array with maximum 50 sections';
@@ -3107,16 +3135,16 @@ app.post('/api/products', productUpload.fields([
       validationError = 'Price must be a valid number';
     }
   } else {
-    return res.status(400).json({ 
-      success: false, 
-      message: `Invalid product type: "${productType}". Must be one of: course, e-book/ebook, app, or gadget. Received: "${productType}" (normalized: "${normalizedType}")` 
+    return res.status(400).json({
+      success: false,
+      message: `Invalid product type: "${productType}". Must be one of: course, e-book/ebook, app, or gadget. Received: "${productType}" (normalized: "${normalizedType}")`
     });
   }
 
   if (validationError) {
-    return res.status(400).json({ 
-      success: false, 
-      message: validationError 
+    return res.status(400).json({
+      success: false,
+      message: validationError
     });
   }
 
@@ -3132,7 +3160,7 @@ app.post('/api/products', productUpload.fields([
     const download_link = data.download_link || null;
     const status = data.status || 'active';
     const featured = data.featured === 'true' || data.featured === '1' ? 1 : 0;
-    
+
     // Course-specific fields
     const subtitle = data.subtitle || null;
     const instructor_name = data.instructor_name || null;
@@ -3160,7 +3188,7 @@ app.post('/api/products', productUpload.fields([
     );
 
     const productId = result.lastID;
-    
+
     // If this is a course, create related data
     if (normalizedType === 'course') {
       try {
@@ -3168,27 +3196,27 @@ app.post('/api/products', productUpload.fields([
         if (data.learning_objectives && Array.isArray(data.learning_objectives)) {
           await createLearningObjectives(productId, data.learning_objectives);
         }
-        
+
         // Create requirements
         if (data.requirements && Array.isArray(data.requirements)) {
           await createRequirements(productId, data.requirements);
         }
-        
+
         // Create course content structure
         if (data.course_content && Array.isArray(data.course_content)) {
           await createCourseContent(productId, data.course_content);
         }
-        
+
         console.log('Course-related data created successfully');
       } catch (error) {
         console.error('Error creating course-related data:', error);
         // Continue with response even if course data creation fails
       }
     }
-    
+
     // Get the created product for response
     const createdProduct = await db.get('SELECT * FROM products WHERE id = ?', productId);
-    
+
     res.status(200).json({
       success: true,
       message: "Product created successfully",
@@ -3197,9 +3225,9 @@ app.post('/api/products', productUpload.fields([
 
   } catch (err) {
     console.error('Error inserting product:', err);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Database error occurred while creating product' 
+    res.status(500).json({
+      success: false,
+      message: 'Database error occurred while creating product'
     });
   }
 });
@@ -3207,33 +3235,33 @@ app.post('/api/products', productUpload.fields([
 // GET /api/products - fetch all products with optional filtering
 app.get('/api/products', async (req, res) => {
   console.log('Products endpoint called with query:', req.query);
-  
+
   try {
     let sql = 'SELECT * FROM products WHERE 1=1';
     let params = [];
-    
+
     // Add filters
     if (req.query.type) {
       sql += ' AND LOWER(product_type) = LOWER(?)';
       params.push(req.query.type);
     }
-    
+
     if (req.query.status) {
       sql += ' AND status = ?';
       params.push(req.query.status);
     }
-    
+
     if (req.query.featured !== undefined) {
       sql += ' AND featured = ?';
       params.push(req.query.featured === 'true' ? 1 : 0);
     }
-    
+
     sql += ' ORDER BY created_at DESC';
     console.log('Executing SQL:', sql, 'with params:', params);
-    
+
     const products = await db.all(sql, params);
     console.log(`Found ${products.length} products`);
-    
+
     // Enhance products with related data for courses
     const enhancedProducts = await Promise.all(products.map(async (product) => {
       if (product.product_type === 'course') {
@@ -3243,7 +3271,7 @@ app.get('/api/products', async (req, res) => {
             getRequirements(product.id),
             getCourseContent(product.id)
           ]);
-          
+
           return {
             ...product,
             learning_objectives: objectives.map(obj => obj.objective),
@@ -3276,12 +3304,12 @@ app.get('/api/products', async (req, res) => {
         };
       }
     }));
-    
+
     res.json({
       success: true,
       products: enhancedProducts
     });
-    
+
   } catch (error) {
     console.error('Error fetching products:', error);
     res.status(500).json({
@@ -3295,7 +3323,7 @@ app.get('/api/products', async (req, res) => {
 app.get('/api/products/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
+
     // Validate ID
     if (!id || isNaN(parseInt(id))) {
       return res.status(400).json({
@@ -3366,7 +3394,7 @@ app.put('/api/products/:id', productUpload.fields([
     const { id } = req.params;
     const data = req.body;
     const files = req.files || {};
-    
+
     // Validate ID
     if (!id || isNaN(parseInt(id))) {
       return res.status(400).json({
@@ -3387,13 +3415,13 @@ app.put('/api/products/:id', productUpload.fields([
     // Prepare update data
     const updateFields = [];
     const updateValues = [];
-    
+
     // Basic fields
-    const fields = ['title', 'name', 'description', 'price', 'video_url', 'author', 
-                   'purchase_link', 'download_link', 'status', 'featured', 'subtitle',
-                   'instructor_name', 'instructor_title', 'instructor_bio', 'duration',
-                   'total_lectures', 'language', 'level', 'rating', 'total_ratings', 'enrolled_students'];
-    
+    const fields = ['title', 'name', 'description', 'price', 'video_url', 'author',
+      'purchase_link', 'download_link', 'status', 'featured', 'subtitle',
+      'instructor_name', 'instructor_title', 'instructor_bio', 'duration',
+      'total_lectures', 'language', 'level', 'rating', 'total_ratings', 'enrolled_students'];
+
     for (const field of fields) {
       if (data[field] !== undefined) {
         let value = data[field];
@@ -3403,12 +3431,12 @@ app.put('/api/products/:id', productUpload.fields([
         }
         if (field === 'rating') value = parseFloat(value) || 0.00;
         if (field === 'featured') value = value === 'true' || value === '1' ? 1 : 0;
-        
+
         updateFields.push(`${field} = ?`);
         updateValues.push(value);
       }
     }
-    
+
     // Handle file uploads
     if (files.thumbnail) {
       updateFields.push('thumbnail = ?');
@@ -3430,13 +3458,13 @@ app.put('/api/products/:id', productUpload.fields([
       updateFields.push('pdf_file = ?');
       updateValues.push('/uploads/pdfs/' + files.pdf_file[0].filename);
     }
-    
+
     // Update main product
     if (updateFields.length > 0) {
       updateValues.push(id);
       await db.run(`UPDATE products SET ${updateFields.join(', ')} WHERE id = ?`, ...updateValues);
     }
-    
+
     // If it's a course, update related data
     if (product.product_type === 'course') {
       try {
@@ -3445,28 +3473,28 @@ app.put('/api/products/:id', productUpload.fields([
           await deleteLearningObjectives(id);
           await createLearningObjectives(id, data.learning_objectives);
         }
-        
+
         // Update requirements
         if (data.requirements && Array.isArray(data.requirements)) {
           await deleteRequirements(id);
           await createRequirements(id, data.requirements);
         }
-        
+
         // Update course content
         if (data.course_content && Array.isArray(data.course_content)) {
           await deleteCourseContent(id);
           await createCourseContent(id, data.course_content);
         }
-        
+
         console.log('Course-related data updated successfully');
       } catch (error) {
         console.error('Error updating course-related data:', error);
       }
     }
-    
+
     // Get updated product
     const updatedProduct = await db.get('SELECT * FROM products WHERE id = ?', id);
-    
+
     res.json({
       success: true,
       message: 'Product updated successfully',
@@ -3486,7 +3514,7 @@ app.put('/api/products/:id', productUpload.fields([
 app.delete('/api/products/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
+
     // Validate ID
     if (!id || isNaN(parseInt(id))) {
       return res.status(400).json({
@@ -3506,7 +3534,7 @@ app.delete('/api/products/:id', async (req, res) => {
 
     // Delete the product (cascade will handle related data)
     await db.run('DELETE FROM products WHERE id = ?', id);
-    
+
     res.json({
       success: true,
       message: 'Product deleted successfully',
@@ -3529,14 +3557,14 @@ app.post('/api/cart/add', async (req, res) => {
   try {
     console.log('Cart add endpoint called with:', req.body);
     const { product_id, user_id, quantity = 1 } = req.body;
-    
+
     if (!product_id || !user_id) {
       return res.status(400).json({
         success: false,
         message: 'Product ID and User ID are required'
       });
     }
-    
+
     // Check if product exists
     const product = await db.get('SELECT * FROM products WHERE id = ?', [product_id]);
     if (!product) {
@@ -3545,14 +3573,14 @@ app.post('/api/cart/add', async (req, res) => {
         message: 'Product not found'
       });
     }
-    
+
     console.log('Product found:', product.id);
-    
+
     // Check if cart table exists
     try {
       const tableCheck = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='cart'");
       console.log('Cart table check result:', tableCheck);
-      
+
       if (!tableCheck) {
         console.log('Cart table does not exist, creating it now...');
         await ensureCartTables();
@@ -3560,13 +3588,13 @@ app.post('/api/cart/add', async (req, res) => {
     } catch (tableError) {
       console.error('Error checking cart table:', tableError);
     }
-    
+
     // Check if item already exists in cart
     const existingItem = await db.get(
       'SELECT * FROM cart WHERE user_id = ? AND product_id = ?',
       [user_id, product_id]
     );
-    
+
     if (existingItem) {
       // Update quantity
       await db.run(
@@ -3580,12 +3608,12 @@ app.post('/api/cart/add', async (req, res) => {
         [user_id, product_id, quantity]
       );
     }
-    
+
     res.json({
       success: true,
       message: 'Item added to cart successfully'
     });
-    
+
   } catch (error) {
     console.error('Error adding item to cart:', error);
     res.status(500).json({
@@ -3600,14 +3628,14 @@ app.post('/api/cart/add', async (req, res) => {
 app.get('/api/cart', async (req, res) => {
   try {
     const { user_id } = req.query;
-    
+
     if (!user_id) {
       return res.status(400).json({
         success: false,
         message: 'User ID is required'
       });
     }
-    
+
     const cartItems = await db.all(`
       SELECT c.id, c.quantity, c.created_at, p.*
       FROM cart c
@@ -3615,12 +3643,12 @@ app.get('/api/cart', async (req, res) => {
       WHERE c.user_id = ?
       ORDER BY c.created_at DESC
     `, [user_id]);
-    
+
     // Calculate total
     const total = cartItems.reduce((sum, item) => {
       return sum + (parseFloat(item.price) * item.quantity);
     }, 0);
-    
+
     res.json({
       success: true,
       cart: {
@@ -3629,7 +3657,7 @@ app.get('/api/cart', async (req, res) => {
         item_count: cartItems.length
       }
     });
-    
+
   } catch (error) {
     console.error('Error fetching cart:', error);
     res.status(500).json({
@@ -3643,21 +3671,21 @@ app.get('/api/cart', async (req, res) => {
 app.delete('/api/cart/remove/:item_id', async (req, res) => {
   try {
     const { item_id } = req.params;
-    
+
     const result = await db.run('DELETE FROM cart WHERE id = ?', [item_id]);
-    
+
     if (result.changes === 0) {
       return res.status(404).json({
         success: false,
         message: 'Cart item not found'
       });
     }
-    
+
     res.json({
       success: true,
       message: 'Item removed from cart successfully'
     });
-    
+
   } catch (error) {
     console.error('Error removing item from cart:', error);
     res.status(500).json({
@@ -3671,21 +3699,21 @@ app.delete('/api/cart/remove/:item_id', async (req, res) => {
 app.delete('/api/cart/clear', async (req, res) => {
   try {
     const { user_id } = req.body;
-    
+
     if (!user_id) {
       return res.status(400).json({
         success: false,
         message: 'User ID is required'
       });
     }
-    
+
     await db.run('DELETE FROM cart WHERE user_id = ?', [user_id]);
-    
+
     res.json({
       success: true,
       message: 'Cart cleared successfully'
     });
-    
+
   } catch (error) {
     console.error('Error clearing cart:', error);
     res.status(500).json({
@@ -3700,34 +3728,34 @@ app.post('/api/cart/checkout', async (req, res) => {
   try {
     console.log('Checkout endpoint called with:', req.body);
     const { user_id, payment_method, billing_address, shipping_address } = req.body;
-    
+
     if (!user_id) {
       return res.status(400).json({
         success: false,
         message: 'User ID is required'
       });
     }
-    
+
     // Check if orders table exists, create it if not
     try {
       const tableCheck = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='orders'");
       console.log('Orders table check result:', tableCheck);
-      
+
       if (!tableCheck) {
         console.log('Orders table does not exist, creating it now...');
-        
+
         // Create orders table directly
         await db.run('CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, user_id TEXT NOT NULL, total_amount REAL NOT NULL, status TEXT, payment_method TEXT, billing_address TEXT, shipping_address TEXT, created_at TEXT, updated_at TEXT)');
-        
+
         // Create order items table
         await db.run('CREATE TABLE IF NOT EXISTS order_items (id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL, product_id INTEGER NOT NULL, quantity INTEGER NOT NULL, price REAL NOT NULL)');
-        
+
         console.log('Orders tables created successfully');
       }
     } catch (tableError) {
       console.error('Error checking orders table:', tableError);
     }
-    
+
     // Get cart items
     const cartItems = await db.all(`
       SELECT c.quantity, p.id, p.price
@@ -3735,32 +3763,32 @@ app.post('/api/cart/checkout', async (req, res) => {
       JOIN products p ON c.product_id = p.id
       WHERE c.user_id = ?
     `, [user_id]);
-    
+
     console.log('Cart items found:', cartItems);
-    
+
     if (cartItems.length === 0) {
       return res.status(400).json({
         success: false,
         message: 'Cart is empty'
       });
     }
-    
+
     // Calculate total
     const total = cartItems.reduce((sum, item) => {
       return sum + (parseFloat(item.price) * item.quantity);
     }, 0);
-    
+
     console.log('Total calculated:', total);
-    
+
     // Create order
     const orderResult = await db.run(`
       INSERT INTO orders (user_id, total_amount, payment_method, billing_address, shipping_address)
       VALUES (?, ?, ?, ?, ?)
     `, [user_id, total.toFixed(2), payment_method, JSON.stringify(billing_address), JSON.stringify(shipping_address)]);
-    
+
     const orderId = orderResult.lastID;
     console.log('Order created with ID:', orderId);
-    
+
     // Create order items
     for (const item of cartItems) {
       await db.run(`
@@ -3768,19 +3796,19 @@ app.post('/api/cart/checkout', async (req, res) => {
         VALUES (?, ?, ?, ?)
       `, [orderId, item.id, item.quantity, item.price]);
     }
-    
+
     console.log('Order items created');
-    
+
     // Clear cart
     await db.run('DELETE FROM cart WHERE user_id = ?', [user_id]);
-    
+
     res.json({
       success: true,
       message: 'Checkout completed successfully',
       order_id: orderId,
       total: total.toFixed(2)
     });
-    
+
   } catch (error) {
     console.error('Error during checkout:', error);
     res.status(500).json({
@@ -3795,16 +3823,16 @@ app.post('/api/cart/checkout', async (req, res) => {
 app.get('/api/orders', async (req, res) => {
   try {
     const { user_id } = req.query;
-    
+
     if (!user_id) {
       return res.status(400).json({
         success: false,
         message: 'User ID is required'
       });
     }
-    
+
     const orders = await db.all(`
-      SELECT o.*, 
+      SELECT o.*,
              COUNT(oi.id) as item_count
       FROM orders o
       LEFT JOIN order_items oi ON o.id = oi.order_id
@@ -3812,12 +3840,12 @@ app.get('/api/orders', async (req, res) => {
       GROUP BY o.id
       ORDER BY o.created_at DESC
     `, [user_id]);
-    
+
     res.json({
       success: true,
       orders: orders
     });
-    
+
   } catch (error) {
     console.error('Error fetching orders:', error);
     res.status(500).json({
@@ -3849,7 +3877,7 @@ app.get('/api/debug/tables', async (req, res) => {
 app.post('/api/debug/create-orders-table', async (req, res) => {
   try {
     console.log('Creating orders table manually...');
-    
+
     // Create orders table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS orders (
@@ -3864,7 +3892,7 @@ app.post('/api/debug/create-orders-table', async (req, res) => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    
+
     // Create order items table
     await db.exec(`
       CREATE TABLE IF NOT EXISTS order_items (
@@ -3877,13 +3905,13 @@ app.post('/api/debug/create-orders-table', async (req, res) => {
         FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
       )
     `);
-    
+
     console.log('Orders tables created successfully');
     res.json({
       success: true,
       message: 'Orders tables created successfully'
     });
-    
+
   } catch (error) {
     console.error('Error creating orders tables:', error);
     res.status(500).json({
