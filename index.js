@@ -8,6 +8,10 @@ import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
 import bodyParser from 'body-parser';
+import { google } from 'googleapis';
+import { OAuth2Client } from 'google-auth-library';
+import nodemailer from 'nodemailer';
+import { v4 as uuidv4 } from 'uuid';
 
 
 const app = express();
@@ -55,10 +59,26 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_change_in_producti
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 const PAYMENT_GATEWAY_API_KEY = process.env.PAYMENT_GATEWAY_API_KEY || 'test_key';
 const PAYMENT_GATEWAY_SECRET = process.env.PAYMENT_GATEWAY_SECRET || 'test_secret';
-const SMTP_HOST = process.env.SMTP_HOST || 'localhost';
+const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = process.env.SMTP_PORT || 587;
-const SMTP_USER = process.env.SMTP_USER || 'test@example.com';
-const SMTP_PASS = process.env.SMTP_PASS || 'test_password';
+const SMTP_USER = process.env.SMTP_USER || 'shaanjyot13@gmail.com';
+const SMTP_PASS = process.env.SMTP_PASS || 'ljym tqld gqly bgep';
+
+// Google OAuth 2.0 Configuration
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '71256414599-qbgdkqe5urtc604ppitmqvg3k62hcgn3.apps.googleusercontent.com';
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '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';
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:4000/api/auth/google/callback';
+
+// Google Calendar API
+const GOOGLE_CALENDAR_API_KEY = process.env.GOOGLE_CALENDAR_API_KEY || 'AIzaSyAmpa3H1449VHQeOA7cJ1h1fp5WUu5d4pM';
+
+// Google Meet API
+const GOOGLE_MEET_API_KEY = process.env.GOOGLE_MEET_API_KEY || 'AIzaSyDV6g8MPDTAtXN52B11HgKQDPDUAPJBQ94';
+
+// Admin Google OAuth (for admin scheduling) - Use same credentials as regular OAuth for now
+const ADMIN_GOOGLE_CLIENT_ID = process.env.ADMIN_GOOGLE_CLIENT_ID || '71256414599-pue21h9bptf8tqo4bdh5k8eb7vbokmff.apps.googleusercontent.com';
+const ADMIN_GOOGLE_CLIENT_SECRET = process.env.ADMIN_GOOGLE_CLIENT_SECRET || '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';
+const ADMIN_GOOGLE_REDIRECT_URI = process.env.ADMIN_GOOGLE_REDIRECT_URI || 'http://localhost:4000/api/auth/admin/google/callback';
 
 // CORS configuration with environment variable support
 const CORS_ORIGINS = process.env.CORS_ORIGINS ?
@@ -97,9 +117,21 @@ async function setupDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE,
       password TEXT,
-      role TEXT CHECK(role IN ('superadmin', 'consultant')) NOT NULL DEFAULT 'consultant',
+      role TEXT CHECK(role IN ('superadmin', 'consultant', 'users')) NOT NULL DEFAULT 'users',
       status TEXT CHECK(status IN ('active', 'inactive')) NOT NULL DEFAULT 'active',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS ailments_category (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS ailments_subcategory (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      category_id INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(category_id) REFERENCES ailments_category(id)
     );
     CREATE TABLE IF NOT EXISTS consultants (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,6 +151,8 @@ async function setupDatabase() {
       aadhar TEXT,
       bank_account TEXT,
       bank_ifsc TEXT,
+      city TEXT,
+      featured BOOLEAN DEFAULT 0,
       status TEXT CHECK(status IN ('online', 'offline')) NOT NULL DEFAULT 'offline',
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(user_id) REFERENCES users(id)
@@ -206,6 +240,7 @@ async function setupDatabase() {
       FOREIGN KEY(consultant_id) REFERENCES consultants(id)
     );
   `);
+
   // Seed admin if not exists
   const admin = await db.get('SELECT * FROM admin WHERE username = ?', 'admin');
   if (!admin) {
@@ -248,14 +283,7 @@ async function setupDatabase() {
   await db.exec("UPDATE users SET status = 'active' WHERE status IS NULL");
 
   // --- MIGRATION: Add name and email columns to users if missing ---
-  if (!userCols.some(col => col.name === 'name')) {
-    await db.exec("ALTER TABLE users ADD COLUMN name TEXT");
-    console.log('Migrated: Added name column to users table.');
-  }
-  if (!userCols.some(col => col.name === 'email')) {
-    await db.exec("ALTER TABLE users ADD COLUMN email TEXT");
-    console.log('Migrated: Added email column to users table.');
-  }
+  // Note: These columns are now included in the main CREATE TABLE statement
 
   // --- MIGRATION: Add new service fields if missing ---
   const serviceCols = await db.all("PRAGMA table_info(services)");
@@ -278,18 +306,16 @@ async function setupDatabase() {
   await addCol('event_image', 'TEXT');
   await addCol('event_meet_link', 'TEXT');
 
-  // --- MIGRATION: Add city column to consultants if missing ---
+  // Note: city and featured columns are now included in the main CREATE TABLE statement
+
+  // --- MIGRATION: Add consultation_price to consultants table if missing ---
   const consultantCols = await db.all("PRAGMA table_info(consultants)");
-  if (!consultantCols.some(col => col.name === 'city')) {
-    await db.exec("ALTER TABLE consultants ADD COLUMN city TEXT");
-    console.log('Migrated: Added city column to consultants table.');
+  if (!consultantCols.some(col => col.name === 'consultation_price')) {
+    await db.exec("ALTER TABLE consultants ADD COLUMN consultation_price REAL DEFAULT 500");
+    console.log('Migrated: Added consultation_price column to consultants table.');
   }
 
-  // --- MIGRATION: Add featured column to consultants if missing ---
-  if (!consultantCols.some(col => col.name === 'featured')) {
-    await db.exec("ALTER TABLE consultants ADD COLUMN featured INTEGER DEFAULT 0");
-    console.log('Migrated: Added featured column to consultants table.');
-  }
+  // Note: featured column is now included in the main CREATE TABLE statement
 
   // --- MIGRATION: Update products table schema if needed ---
   try {
@@ -331,6 +357,387 @@ async function setupDatabase() {
   } catch (err) {
     console.log('Products table migration check skipped (table may not exist yet).');
   }
+
+  // --- Google OAuth and Meeting Tables ---
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS google_oauth_tokens (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      user_type TEXT CHECK(user_type IN ('admin', 'consultant', 'user')) NOT NULL,
+      access_token TEXT NOT NULL,
+      refresh_token TEXT,
+      token_type TEXT DEFAULT 'Bearer',
+      scope TEXT,
+      expires_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS appointments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      appointment_id TEXT UNIQUE NOT NULL,
+      consultant_id INTEGER,
+      user_id INTEGER,
+      title TEXT NOT NULL,
+      description TEXT,
+      start_time DATETIME NOT NULL,
+      end_time DATETIME NOT NULL,
+      duration_minutes INTEGER NOT NULL,
+      meeting_type TEXT CHECK(meeting_type IN ('consultation', 'webinar')) NOT NULL,
+      status TEXT CHECK(status IN ('scheduled', 'confirmed', 'cancelled', 'completed', 'no_show')) DEFAULT 'scheduled',
+      google_meet_link TEXT,
+      google_calendar_event_id TEXT,
+      price REAL,
+      payment_status TEXT CHECK(payment_status IN ('pending', 'paid', 'refunded')) DEFAULT 'pending',
+      payment_id TEXT,
+      attendee_emails TEXT, -- JSON array of email addresses
+      notes TEXT,
+      user_name TEXT, -- For external users who don't have accounts
+      user_email TEXT, -- For external users who don't have accounts
+      user_phone TEXT, -- For external users who don't have accounts
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(consultant_id) REFERENCES consultants(id),
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS webinars (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      webinar_id TEXT UNIQUE NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      start_time DATETIME NOT NULL,
+      end_time DATETIME NOT NULL,
+      duration_minutes INTEGER NOT NULL,
+      max_attendees INTEGER DEFAULT 100,
+      current_attendees INTEGER DEFAULT 0,
+      status TEXT CHECK(status IN ('scheduled', 'live', 'ended', 'cancelled')) DEFAULT 'scheduled',
+      google_meet_link TEXT,
+      google_calendar_event_id TEXT,
+      price REAL DEFAULT 0,
+      is_free BOOLEAN DEFAULT 1,
+      organizer_email TEXT NOT NULL,
+      attendee_emails TEXT, -- JSON array of email addresses
+      meeting_notes TEXT,
+      recording_url TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS appointment_attendees (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      appointment_id INTEGER,
+      email TEXT NOT NULL,
+      name TEXT,
+      status TEXT CHECK(status IN ('invited', 'accepted', 'declined', 'tentative')) DEFAULT 'invited',
+      response_time DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(appointment_id) REFERENCES appointments(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS webinar_attendees (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      webinar_id INTEGER,
+      email TEXT NOT NULL,
+      name TEXT,
+      status TEXT CHECK(status IN ('registered', 'attended', 'no_show')) DEFAULT 'registered',
+      registration_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+      attendance_time DATETIME,
+      FOREIGN KEY(webinar_id) REFERENCES webinars(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS consultant_google_calendars (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      consultant_id INTEGER UNIQUE,
+      calendar_id TEXT NOT NULL,
+      calendar_name TEXT,
+      timezone TEXT DEFAULT 'Asia/Kolkata',
+      is_primary BOOLEAN DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(consultant_id) REFERENCES consultants(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS users_auth (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      first_name TEXT NOT NULL,
+      last_name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT,
+      phone TEXT,
+      google_id TEXT UNIQUE,
+      is_verified BOOLEAN DEFAULT 0,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  console.log('Google Meet and Calendar integration tables created successfully.');
+
+  // Ensure additional tables exist
+  try {
+    await ensureProductsTableV2();
+    console.log('Products table ensured successfully.');
+  } catch (error) {
+    console.error('Error ensuring products table:', error);
+  }
+
+  try {
+    await ensureBlogsTable();
+    console.log('Blogs table ensured successfully.');
+  } catch (error) {
+    console.error('Error ensuring blogs table:', error);
+  }
+
+  try {
+    await ensureEcommerceTables();
+    console.log('E-commerce tables ensured successfully.');
+  } catch (error) {
+    console.error('Error ensuring e-commerce tables:', error);
+  }
+
+  // --- MIGRATION: Update users table to support 'users' role ---
+  try {
+    // Check if the users table has the 'users' role in its CHECK constraint
+    const tableInfo = await db.all("PRAGMA table_info(users)");
+    const hasRoleColumn = tableInfo.some(col => col.name === 'role');
+
+    if (hasRoleColumn) {
+      // Check if the constraint already includes 'users' role
+      const tableSchema = await db.get("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'");
+      if (tableSchema && !tableSchema.sql.includes("'users'")) {
+        console.log('Migrating users table to support "users" role...');
+
+        // Create a new table with the updated constraint
+        await db.exec(`
+          CREATE TABLE users_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password TEXT,
+            role TEXT CHECK(role IN ('superadmin', 'consultant', 'users')) NOT NULL DEFAULT 'users',
+            status TEXT CHECK(status IN ('active', 'inactive')) NOT NULL DEFAULT 'active',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `);
+
+        // Copy data from old table to new table
+        await db.exec(`
+          INSERT INTO users_new (id, username, password, role, status, created_at)
+          SELECT
+            id,
+            username,
+            password,
+            COALESCE(role, 'users') as role,
+            COALESCE(status, 'active') as status,
+            COALESCE(created_at, CURRENT_TIMESTAMP) as created_at
+          FROM users;
+        `);
+
+        // Drop old table and rename new table
+        await db.exec('DROP TABLE users;');
+        await db.exec('ALTER TABLE users_new RENAME TO users;');
+
+        console.log('Users table migration completed successfully.');
+      } else {
+        console.log('Users table already supports "users" role.');
+      }
+    } else {
+      console.log('Users table does not have role column, skipping migration.');
+    }
+  } catch (error) {
+    console.error('Error migrating users table:', error);
+    // Don't throw error, just log it so the main process continues
+  }
+}
+
+// --- Google OAuth and Calendar API Utilities ---
+const oauth2Client = new OAuth2Client(
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_REDIRECT_URI
+);
+
+const adminOauth2Client = new OAuth2Client(
+  ADMIN_GOOGLE_CLIENT_ID,
+  ADMIN_GOOGLE_CLIENT_SECRET,
+  ADMIN_GOOGLE_REDIRECT_URI
+);
+
+// Note: user_name, user_email, user_phone columns are now included in the main CREATE TABLE statement
+
+// Email transporter setup
+const emailTransporter = nodemailer.createTransport({
+  host: SMTP_HOST,
+  port: SMTP_PORT,
+  secure: SMTP_PORT === 465, // true for 465, false for other ports
+  auth: {
+    user: SMTP_USER,
+    pass: SMTP_PASS
+  },
+  tls: {
+    rejectUnauthorized: false // Allow self-signed certificates
+  }
+});
+
+// Verify email configuration
+emailTransporter.verify((error, success) => {
+  if (error) {
+    console.log('SMTP configuration error:', error.message);
+    console.log('Email notifications will be disabled. Please configure SMTP settings.');
+  } else {
+    console.log('SMTP server is ready to send emails');
+  }
+});
+
+// Google Calendar API utility functions
+async function getGoogleCalendarClient(userId, userType = 'user') {
+  try {
+    const tokenRecord = await db.get(
+      'SELECT * FROM google_oauth_tokens WHERE user_id = ? AND user_type = ?',
+      [userId, userType]
+    );
+
+    if (!tokenRecord) {
+      throw new Error('No Google OAuth token found for user');
+    }
+
+    const client = userType === 'admin' ? adminOauth2Client : oauth2Client;
+    client.setCredentials({
+      access_token: tokenRecord.access_token,
+      refresh_token: tokenRecord.refresh_token
+    });
+
+    // Check if token is expired and refresh if needed
+    if (tokenRecord.expires_at && new Date(tokenRecord.expires_at) <= new Date()) {
+      const { credentials } = await client.refreshAccessToken();
+
+      // Update token in database
+      await db.run(
+        'UPDATE google_oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [
+          credentials.access_token,
+          credentials.refresh_token,
+          new Date(credentials.expiry_date).toISOString(),
+          tokenRecord.id
+        ]
+      );
+
+      client.setCredentials(credentials);
+    }
+
+    return google.calendar({ version: 'v3', auth: client });
+  } catch (error) {
+    console.error('Error getting Google Calendar client:', error);
+    throw error;
+  }
+}
+
+// Create Google Meet event
+async function createGoogleMeetEvent(calendarClient, eventDetails) {
+  try {
+    // Validate and format dates
+    const startDate = new Date(eventDetails.startTime);
+    const endDate = new Date(eventDetails.endTime);
+
+    // Check if dates are valid
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      throw new Error('Invalid date format provided');
+    }
+
+    // Check if end time is after start time
+    if (endDate <= startDate) {
+      throw new Error('End time must be after start time');
+    }
+
+    // Format dates to ISO string with timezone
+    const startDateTime = startDate.toISOString();
+    const endDateTime = endDate.toISOString();
+
+    console.log('Creating Google Meet event with dates:', {
+      start: startDateTime,
+      end: endDateTime,
+      title: eventDetails.title
+    });
+
+    const event = {
+      summary: eventDetails.title,
+      description: eventDetails.description || '',
+      start: {
+        dateTime: startDateTime,
+        timeZone: eventDetails.timezone || 'Asia/Kolkata'
+      },
+      end: {
+        dateTime: endDateTime,
+        timeZone: eventDetails.timezone || 'Asia/Kolkata'
+      },
+      attendees: eventDetails.attendees || [],
+      conferenceData: {
+        createRequest: {
+          requestId: uuidv4(),
+          conferenceSolutionKey: {
+            type: 'hangoutsMeet'
+          }
+        }
+      },
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: 'email', minutes: 24 * 60 }, // 1 day before
+          { method: 'popup', minutes: 10 } // 10 minutes before
+        ]
+      }
+    };
+
+    const response = await calendarClient.events.insert({
+      calendarId: 'primary',
+      resource: event,
+      conferenceDataVersion: 1,
+      sendUpdates: 'all'
+    });
+
+    console.log('Google Meet event created successfully:', response.data.id);
+    return response.data;
+  } catch (error) {
+    console.error('Error creating Google Meet event:', error);
+    throw error;
+  }
+}
+
+// Send email notification
+async function sendEmailNotification(to, subject, htmlContent, textContent) {
+  try {
+    // Check if SMTP is properly configured
+    if (SMTP_PASS === 'your_app_password_here' || !SMTP_PASS) {
+      console.log('SMTP not configured, skipping email notification');
+      return { success: false, message: 'SMTP not configured' };
+    }
+
+    const mailOptions = {
+      from: SMTP_USER,
+      to: Array.isArray(to) ? to.join(', ') : to,
+      subject: subject,
+      html: htmlContent,
+      text: textContent
+    };
+
+    const result = await emailTransporter.sendMail(mailOptions);
+    console.log('Email sent successfully:', result.messageId);
+    return result;
+  } catch (error) {
+    console.error('Error sending email:', error.message);
+    // Don't throw error, just log it so the main process continues
+    return { success: false, error: error.message };
+  }
+}
+
+// Generate appointment ID
+function generateAppointmentId() {
+  return `APT-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
+}
+
+// Generate webinar ID
+function generateWebinarId() {
+  return `WEB-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
 }
 
 (async () => {
@@ -376,7 +783,7 @@ function authenticateUser(req, res, next) {
 
     try {
       // Get user from database
-      const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.userId);
+      const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.id);
       if (!user) {
         return res.status(404).json({
           success: false,
@@ -577,10 +984,20 @@ app.post('/api/auth/login', async (req, res) => {
 // GET /api/auth/profile - Get user profile
 app.get('/api/auth/profile', authenticateUser, async (req, res) => {
   try {
+    console.log('Profile request received for user:', req.user);
     const userId = req.user.id;
 
     // Get user profile
     const user = await db.get('SELECT id, first_name, last_name, email, phone, created_at FROM users_auth WHERE id = ?', userId);
+    console.log('User found in database:', user);
+
+    if (!user) {
+      console.log('User not found in database');
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
 
     // Get user addresses
     const addresses = await db.all('SELECT * FROM user_addresses WHERE user_id = ? ORDER BY is_default DESC, created_at DESC', userId);
@@ -638,6 +1055,203 @@ app.put('/api/auth/profile', authenticateUser, async (req, res) => {
       success: false,
       message: 'Error updating profile'
     });
+  }
+});
+
+// --- Google OAuth Authentication Routes ---
+
+// GET /api/auth/google - Initiate Google OAuth flow
+app.get('/api/auth/google', async (req, res) => {
+  try {
+    const scopes = [
+      'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/calendar.events',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile'
+    ];
+
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: scopes,
+      prompt: 'consent'
+    });
+
+    res.json({ authUrl });
+  } catch (error) {
+    console.error('Error generating Google OAuth URL:', error);
+    res.status(500).json({ error: 'Failed to generate OAuth URL' });
+  }
+});
+
+// GET /api/auth/google/callback - Handle Google OAuth callback
+app.get('/api/auth/google/callback', async (req, res) => {
+  try {
+    const { code } = req.query;
+
+    if (!code) {
+      return res.status(400).json({ error: 'Authorization code not provided' });
+    }
+
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    // Get user info from Google
+    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+    const userInfo = await oauth2.userinfo.get();
+
+    const { email, name, id: googleId } = userInfo.data;
+
+    // Check if user exists in our database
+    let user = await db.get('SELECT * FROM users_auth WHERE email = ?', email);
+
+    if (!user) {
+      // Create new user in users_auth table
+      const result = await db.run(
+        'INSERT INTO users_auth (first_name, last_name, email, google_id, is_verified) VALUES (?, ?, ?, ?, ?)',
+        [name.split(' ')[0] || '', name.split(' ').slice(1).join(' ') || '', email, googleId, 1]
+      );
+
+      // Also create user in users table for admin panel
+      const usersResult = await db.run(
+        'INSERT INTO users (username, password, role, status) VALUES (?, ?, ?, ?)',
+        [email, '', 'users', 'active']
+      );
+
+      user = { id: result.lastID, email, first_name: name.split(' ')[0] || '', last_name: name.split(' ').slice(1).join(' ') || '' };
+    } else {
+      // Update existing user in users table if needed
+      const existingUser = await db.get('SELECT * FROM users WHERE username = ?', email);
+      if (!existingUser) {
+        await db.run(
+          'INSERT INTO users (username, password, role, status) VALUES (?, ?, ?, ?)',
+          [email, '', 'users', 'active']
+        );
+      }
+    }
+
+    // Store or update Google OAuth tokens
+    const existingToken = await db.get(
+      'SELECT * FROM google_oauth_tokens WHERE user_id = ? AND user_type = ?',
+      [user.id, 'user']
+    );
+
+    if (existingToken) {
+      await db.run(
+        'UPDATE google_oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [
+          tokens.access_token,
+          tokens.refresh_token,
+          new Date(tokens.expiry_date).toISOString(),
+          existingToken.id
+        ]
+      );
+    } else {
+      await db.run(
+        'INSERT INTO google_oauth_tokens (user_id, user_type, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?, ?)',
+        [
+          user.id,
+          'user',
+          tokens.access_token,
+          tokens.refresh_token,
+          new Date(tokens.expiry_date).toISOString()
+        ]
+      );
+    }
+
+    // Generate JWT token (using 'id' to match authenticateUser middleware)
+    const jwtToken = jwt.sign(
+      { id: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    // Redirect to frontend with token
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}?token=${jwtToken}&google_auth=true`);
+
+  } catch (error) {
+    console.error('Error in Google OAuth callback:', error);
+    res.status(500).json({ error: 'OAuth authentication failed' });
+  }
+});
+
+// GET /api/auth/admin/google - Initiate Admin Google OAuth flow
+app.get('/api/auth/admin/google', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const scopes = [
+      'https://www.googleapis.com/auth/calendar',
+      'https://www.googleapis.com/auth/calendar.events',
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile'
+    ];
+
+    const authUrl = adminOauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: scopes,
+      prompt: 'consent'
+    });
+
+    res.json({ authUrl });
+  } catch (error) {
+    console.error('Error generating Admin Google OAuth URL:', error);
+    res.status(500).json({ error: 'Failed to generate OAuth URL' });
+  }
+});
+
+// GET /api/auth/admin/google/callback - Handle Admin Google OAuth callback
+app.get('/api/auth/admin/google/callback', async (req, res) => {
+  try {
+    const { code } = req.query;
+
+    // Get admin user from the authorization code or use a default admin
+    // For now, we'll use the first superadmin user
+    const adminUser = await db.get('SELECT * FROM users WHERE role = ? LIMIT 1', 'superadmin');
+    if (!adminUser) {
+      return res.status(404).json({ error: 'No admin user found' });
+    }
+    const adminUserId = adminUser.id;
+
+    if (!code) {
+      return res.status(400).json({ error: 'Authorization code not provided' });
+    }
+
+    const { tokens } = await adminOauth2Client.getToken(code);
+    adminOauth2Client.setCredentials(tokens);
+
+    // Store or update Admin Google OAuth tokens
+    const existingToken = await db.get(
+      'SELECT * FROM google_oauth_tokens WHERE user_id = ? AND user_type = ?',
+      [adminUserId, 'admin']
+    );
+
+    if (existingToken) {
+      await db.run(
+        'UPDATE google_oauth_tokens SET access_token = ?, refresh_token = ?, expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [
+          tokens.access_token,
+          tokens.refresh_token,
+          new Date(tokens.expiry_date).toISOString(),
+          existingToken.id
+        ]
+      );
+    } else {
+      await db.run(
+        'INSERT INTO google_oauth_tokens (user_id, user_type, access_token, refresh_token, expires_at) VALUES (?, ?, ?, ?, ?)',
+        [
+          adminUserId,
+          'admin',
+          tokens.access_token,
+          tokens.refresh_token,
+          new Date(tokens.expiry_date).toISOString()
+        ]
+      );
+    }
+
+    // Redirect back to admin dashboard with success message
+    res.redirect(`${process.env.FRONTEND_URL || 'http://localhost:3000'}/admin/dashboard?oauth_success=true&message=Google OAuth setup completed successfully`);
+
+  } catch (error) {
+    console.error('Error in Admin Google OAuth callback:', error);
+    res.status(500).json({ error: 'Admin OAuth authentication failed' });
   }
 });
 
@@ -741,6 +1355,22 @@ app.get('/api/consultants/public', async (req, res) => {
     };
   });
   res.json(result);
+});
+
+// Public: Get consultant availability (no auth required)
+app.get('/api/consultants/:id/availability/public', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', id);
+    if (!consultant) {
+      return res.status(404).json({ error: 'Consultant not found' });
+    }
+    const slots = await db.all('SELECT * FROM consultant_availability WHERE consultant_id = ? ORDER BY date, start_time', id);
+    res.json(slots);
+  } catch (error) {
+    console.error('Error fetching consultant availability:', error);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // Public: Get featured consultants only (no auth required)
@@ -2270,6 +2900,782 @@ app.delete('/api/auth/addresses/:addressId', authenticateUser, async (req, res) 
   }
 });
 
+// --- Appointment and Webinar Scheduling Routes ---
+
+// POST /api/appointments - Create new appointment
+app.post('/api/appointments', authenticateUser, async (req, res) => {
+  try {
+    const {
+      consultant_id,
+      title,
+      description,
+      start_time,
+      end_time,
+      duration_minutes,
+      attendee_emails,
+      notes,
+      price
+    } = req.body;
+
+    const userId = req.user.id;
+
+    // Validate required fields
+    if (!consultant_id || !title || !start_time || !end_time || !duration_minutes) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields'
+      });
+    }
+
+    // Check if consultant exists
+    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', consultant_id);
+    if (!consultant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Consultant not found'
+      });
+    }
+
+    // Generate appointment ID
+    const appointmentId = generateAppointmentId();
+
+    // Create appointment in database
+    const result = await db.run(
+      `INSERT INTO appointments (
+        appointment_id, consultant_id, user_id, title, description,
+        start_time, end_time, duration_minutes, meeting_type,
+        attendee_emails, notes, price, status, payment_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        appointmentId, consultant_id, userId, title, description,
+        start_time, end_time, duration_minutes, 'consultation',
+        JSON.stringify(attendee_emails || []), notes, price || 0,
+        'scheduled', 'pending'
+      ]
+    );
+
+    // Get Google Calendar client for user
+    try {
+      const calendarClient = await getGoogleCalendarClient(userId, 'user');
+
+      // Create Google Meet event
+      const eventDetails = {
+        title: title,
+        description: description || '',
+        startTime: start_time,
+        endTime: end_time,
+        timezone: 'Asia/Kolkata',
+        attendees: (attendee_emails || []).map(email => ({ email }))
+      };
+
+      const googleEvent = await createGoogleMeetEvent(calendarClient, eventDetails);
+
+      // Update appointment with Google Meet details
+      await db.run(
+        'UPDATE appointments SET google_meet_link = ?, google_calendar_event_id = ? WHERE id = ?',
+        [googleEvent.conferenceData?.entryPoints?.[0]?.uri, googleEvent.id, result.lastID]
+      );
+
+      // Send email notifications
+      const emailSubject = `Appointment Scheduled: ${title}`;
+      const emailHtml = `
+        <h2>Appointment Scheduled Successfully</h2>
+        <p><strong>Title:</strong> ${title}</p>
+        <p><strong>Consultant:</strong> ${consultant.name}</p>
+        <p><strong>Date & Time:</strong> ${new Date(start_time).toLocaleString()}</p>
+        <p><strong>Duration:</strong> ${duration_minutes} minutes</p>
+        <p><strong>Google Meet Link:</strong> <a href="${googleEvent.conferenceData?.entryPoints?.[0]?.uri}">Join Meeting</a></p>
+        ${description ? `<p><strong>Description:</strong> ${description}</p>` : ''}
+        ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ''}
+      `;
+
+      // Send to user
+      await sendEmailNotification(req.user.email, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+
+      // Send to consultant
+      if (consultant.email) {
+        await sendEmailNotification(consultant.email, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+      }
+
+      // Send to attendees
+      if (attendee_emails && attendee_emails.length > 0) {
+        await sendEmailNotification(attendee_emails, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+      }
+
+    } catch (googleError) {
+      console.error('Google Calendar integration error:', googleError);
+      // Continue without Google integration if it fails
+    }
+
+    res.json({
+      success: true,
+      message: 'Appointment scheduled successfully',
+      appointment: {
+        id: result.lastID,
+        appointment_id: appointmentId,
+        consultant_id,
+        title,
+        start_time,
+        end_time,
+        status: 'scheduled'
+      }
+    });
+
+  } catch (error) {
+    console.error('Error creating appointment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error scheduling appointment'
+    });
+  }
+});
+
+// POST /api/webinars - Create new webinar (Admin only)
+app.post('/api/webinars', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const {
+      title,
+      description,
+      start_time,
+      end_time,
+      duration_minutes,
+      max_attendees,
+      price,
+      is_free,
+      attendee_emails,
+      meeting_notes
+    } = req.body;
+
+    const adminUserId = req.user.id;
+
+    // Validate required fields
+    if (!title || !start_time || !end_time || !duration_minutes) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields'
+      });
+    }
+
+    // Generate webinar ID
+    const webinarId = generateWebinarId();
+
+    // Get admin email from Google OAuth tokens or use default
+    let adminEmail = 'admin@miet.com'; // Default admin email
+    try {
+      const oauthToken = await db.get(
+        'SELECT * FROM google_oauth_tokens WHERE user_id = ? AND user_type = ?',
+        [adminUserId, 'admin']
+      );
+      if (oauthToken && oauthToken.access_token) {
+        // Try to get email from Google API
+        const oauth2Client = new OAuth2Client(
+          process.env.ADMIN_GOOGLE_CLIENT_ID,
+          process.env.ADMIN_GOOGLE_CLIENT_SECRET,
+          process.env.ADMIN_GOOGLE_REDIRECT_URI
+        );
+        oauth2Client.setCredentials({
+          access_token: oauthToken.access_token,
+          refresh_token: oauthToken.refresh_token
+        });
+
+        const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+        const userInfo = await oauth2.userinfo.get();
+        if (userInfo.data.email) {
+          adminEmail = userInfo.data.email;
+        }
+      }
+    } catch (error) {
+      console.log('Could not get admin email from Google OAuth, using default:', adminEmail);
+    }
+
+    // Create webinar in database
+    const result = await db.run(
+      `INSERT INTO webinars (
+        webinar_id, title, description, start_time, end_time,
+        duration_minutes, max_attendees, price, is_free,
+        attendee_emails, meeting_notes, organizer_email, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        webinarId, title, description, start_time, end_time,
+        duration_minutes, max_attendees || 100, price || 0, is_free ? 1 : 0,
+        JSON.stringify(attendee_emails || []), meeting_notes, adminEmail,
+        'scheduled'
+      ]
+    );
+
+    // Get Google Calendar client for admin
+    try {
+      const calendarClient = await getGoogleCalendarClient(adminUserId, 'admin');
+
+      // Create Google Meet event
+      const eventDetails = {
+        title: title,
+        description: description || '',
+        startTime: start_time,
+        endTime: end_time,
+        timezone: 'Asia/Kolkata',
+        attendees: (attendee_emails || []).map(email => ({ email }))
+      };
+
+      const googleEvent = await createGoogleMeetEvent(calendarClient, eventDetails);
+
+      // Update webinar with Google Meet details
+      await db.run(
+        'UPDATE webinars SET google_meet_link = ?, google_calendar_event_id = ? WHERE id = ?',
+        [googleEvent.conferenceData?.entryPoints?.[0]?.uri, googleEvent.id, result.lastID]
+      );
+
+      // Send email notifications
+      const emailSubject = `Webinar Scheduled: ${title}`;
+      const emailHtml = `
+        <h2>Webinar Scheduled Successfully</h2>
+        <p><strong>Title:</strong> ${title}</p>
+        <p><strong>Date & Time:</strong> ${new Date(start_time).toLocaleString()}</p>
+        <p><strong>Duration:</strong> ${duration_minutes} minutes</p>
+        <p><strong>Max Attendees:</strong> ${max_attendees || 100}</p>
+        <p><strong>Price:</strong> ${is_free ? 'Free' : `₹${price}`}</p>
+        <p><strong>Google Meet Link:</strong> <a href="${googleEvent.conferenceData?.entryPoints?.[0]?.uri}">Join Webinar</a></p>
+        ${description ? `<p><strong>Description:</strong> ${description}</p>` : ''}
+        ${meeting_notes ? `<p><strong>Meeting Notes:</strong> ${meeting_notes}</p>` : ''}
+      `;
+
+      // Send to attendees
+      if (attendee_emails && attendee_emails.length > 0) {
+        await sendEmailNotification(attendee_emails, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+      }
+
+    } catch (googleError) {
+      console.error('Google Calendar integration error:', googleError);
+      // Continue without Google integration if it fails
+    }
+
+    res.json({
+      success: true,
+      message: 'Webinar scheduled successfully',
+      webinar: {
+        id: result.lastID,
+        webinar_id: webinarId,
+        title,
+        start_time,
+        end_time,
+        status: 'scheduled'
+      }
+    });
+
+  } catch (error) {
+    console.error('Error creating webinar:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error scheduling webinar'
+    });
+  }
+});
+
+// Create consultation (Admin only) - Alternative endpoint for admin dashboard
+app.post('/api/admin/consultations', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const {
+      consultant_id,
+      title,
+      description,
+      start_time,
+      end_time,
+      duration_minutes,
+      attendee_emails,
+      notes,
+      price,
+      status,
+      payment_status
+    } = req.body;
+
+    const adminUserId = req.user.id;
+
+    // Validate required fields
+    if (!consultant_id || !title || !start_time || !end_time || !duration_minutes) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields'
+      });
+    }
+
+    // Check if consultant exists
+    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', consultant_id);
+    if (!consultant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Consultant not found'
+      });
+    }
+
+    // Generate appointment ID
+    const appointmentId = generateAppointmentId();
+
+    // Create consultation in database
+    const result = await db.run(
+      `INSERT INTO appointments (
+        appointment_id, consultant_id, user_id, title, description,
+        start_time, end_time, duration_minutes, meeting_type,
+        attendee_emails, notes, price, status, payment_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        appointmentId, consultant_id, adminUserId, title, description,
+        start_time, end_time, duration_minutes, 'consultation',
+        JSON.stringify(attendee_emails || []), notes, price || 0,
+        status || 'scheduled', payment_status || 'pending'
+      ]
+    );
+
+    // Get Google Calendar client for admin
+    try {
+      const calendarClient = await getGoogleCalendarClient(adminUserId, 'admin');
+
+      // Create Google Meet event
+      const eventDetails = {
+        title: title,
+        description: description || '',
+        startTime: start_time,
+        endTime: end_time,
+        timezone: 'Asia/Kolkata',
+        attendees: (attendee_emails || []).map(email => ({ email }))
+      };
+
+      const googleEvent = await createGoogleMeetEvent(calendarClient, eventDetails);
+
+      // Update consultation with Google Meet details
+      await db.run(
+        'UPDATE appointments SET google_meet_link = ?, google_calendar_event_id = ? WHERE id = ?',
+        [googleEvent.conferenceData?.entryPoints?.[0]?.uri, googleEvent.id, result.lastID]
+      );
+
+      // Send email notifications
+      const emailSubject = `Consultation Scheduled: ${title}`;
+      const emailHtml = `
+        <h2>Consultation Scheduled Successfully</h2>
+        <p><strong>Title:</strong> ${title}</p>
+        <p><strong>Consultant:</strong> ${consultant.name}</p>
+        <p><strong>Date & Time:</strong> ${new Date(start_time).toLocaleString()}</p>
+        <p><strong>Duration:</strong> ${duration_minutes} minutes</p>
+        <p><strong>Price:</strong> ₹${price || 0}</p>
+        <p><strong>Google Meet Link:</strong> <a href="${googleEvent.conferenceData?.entryPoints?.[0]?.uri}">Join Meeting</a></p>
+        ${description ? `<p><strong>Description:</strong> ${description}</p>` : ''}
+        ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ''}
+      `;
+
+      // Send to consultant
+      if (consultant.email) {
+        await sendEmailNotification(consultant.email, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+      }
+
+      // Send to attendees
+      if (attendee_emails && attendee_emails.length > 0) {
+        await sendEmailNotification(attendee_emails, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+      }
+
+    } catch (googleError) {
+      console.error('Google Calendar integration error:', googleError);
+      // Continue without Google integration if it fails
+    }
+
+    res.json({
+      success: true,
+      message: 'Consultation scheduled successfully',
+      consultation: {
+        id: result.lastID,
+        appointment_id: appointmentId,
+        title,
+        consultant_id,
+        start_time,
+        end_time,
+        status: status || 'scheduled'
+      }
+    });
+
+  } catch (error) {
+    console.error('Error creating consultation:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error scheduling consultation'
+    });
+  }
+});
+
+// GET /api/admin/consultations - Get all consultations (Admin only)
+app.get('/api/admin/consultations', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const consultations = await db.all(
+      `SELECT a.*, c.name as consultant_name, c.email as consultant_email,
+              u.first_name, u.last_name, u.email as user_account_email
+       FROM appointments a
+       LEFT JOIN consultants c ON a.consultant_id = c.id
+       LEFT JOIN users_auth u ON a.user_id = u.id
+       WHERE a.meeting_type = 'consultation'
+       ORDER BY a.start_time DESC`
+    );
+
+    res.json({
+      success: true,
+      consultations: consultations.map(apt => ({
+        ...apt,
+        attendee_emails: JSON.parse(apt.attendee_emails || '[]')
+      }))
+    });
+
+  } catch (error) {
+    console.error('Error fetching consultations:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching consultations'
+    });
+  }
+});
+
+// PUT /api/admin/consultations/:id - Update consultation (Admin only)
+app.put('/api/admin/consultations/:id', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    // Build dynamic update query
+    const allowedFields = [
+      'title', 'description', 'start_time', 'end_time', 'duration_minutes',
+      'attendee_emails', 'notes', 'price', 'status', 'payment_status'
+    ];
+
+    const updateFields = [];
+    const values = [];
+
+    for (const field of allowedFields) {
+      if (updates[field] !== undefined) {
+        updateFields.push(`${field} = ?`);
+        if (field === 'attendee_emails') {
+          values.push(JSON.stringify(updates[field]));
+        } else {
+          values.push(updates[field]);
+        }
+      }
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid fields to update'
+      });
+    }
+
+    values.push(id);
+
+    await db.run(
+      `UPDATE appointments SET ${updateFields.join(', ')} WHERE id = ?`,
+      ...values
+    );
+
+    res.json({
+      success: true,
+      message: 'Consultation updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Error updating consultation:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating consultation'
+    });
+  }
+});
+
+// DELETE /api/admin/consultations/:id - Delete consultation (Admin only)
+app.delete('/api/admin/consultations/:id', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await db.run('DELETE FROM appointments WHERE id = ?', [id]);
+
+    res.json({
+      success: true,
+      message: 'Consultation deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Error deleting consultation:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting consultation'
+    });
+  }
+});
+
+// DELETE /api/consultations/by-email/:id - Delete consultation by email (for OAuth users)
+app.delete('/api/consultations/by-email/:id', authenticateUser, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userEmail = req.user.email;
+
+    // First check if the consultation exists and belongs to this user
+    const consultation = await db.get(
+      'SELECT * FROM appointments WHERE id = ? AND user_email = ?',
+      [id, userEmail]
+    );
+
+    if (!consultation) {
+      return res.status(404).json({
+        success: false,
+        message: 'Consultation not found or you do not have permission to delete it'
+      });
+    }
+
+    // Delete the consultation
+    await db.run('DELETE FROM appointments WHERE id = ?', [id]);
+
+    res.json({
+      success: true,
+      message: 'Consultation deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Error deleting consultation by email:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting consultation'
+    });
+  }
+});
+
+// GET /api/appointments - Get user's appointments
+app.get('/api/appointments', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const appointments = await db.all(
+      `SELECT a.*, c.name as consultant_name, c.email as consultant_email
+       FROM appointments a
+       LEFT JOIN consultants c ON a.consultant_id = c.id
+       WHERE a.user_id = ?
+       ORDER BY a.start_time DESC`,
+      [userId]
+    );
+
+    res.json({
+      success: true,
+      appointments: appointments.map(apt => ({
+        ...apt,
+        attendee_emails: JSON.parse(apt.attendee_emails || '[]')
+      }))
+    });
+
+  } catch (error) {
+    console.error('Error fetching appointments:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching appointments'
+    });
+  }
+});
+
+// GET /api/consultations/by-email - Get consultations by user email (for OAuth users)
+app.get('/api/consultations/by-email', authenticateUser, async (req, res) => {
+  try {
+    const userEmail = req.user.email;
+    console.log('Fetching consultations for email:', userEmail);
+
+    // First, let's check all appointments to see what's in the database
+    const allAppointments = await db.all('SELECT * FROM appointments');
+    console.log('All appointments in database:', allAppointments.length);
+    console.log('Sample appointment:', allAppointments[0]);
+
+    const appointments = await db.all(
+      `SELECT a.*, c.name as consultant_name, c.email as consultant_email
+       FROM appointments a
+       LEFT JOIN consultants c ON a.consultant_id = c.id
+       WHERE a.user_email = ? AND a.meeting_type = 'consultation'
+       ORDER BY a.start_time DESC`,
+      [userEmail]
+    );
+
+    console.log('Found appointments for email:', appointments.length);
+    console.log('Appointments data:', appointments);
+
+    res.json({
+      success: true,
+      appointments: appointments.map(apt => ({
+        ...apt,
+        attendee_emails: JSON.parse(apt.attendee_emails || '[]')
+      }))
+    });
+  } catch (error) {
+    console.error('Error fetching consultations by email:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching consultations'
+    });
+  }
+});
+
+// GET /api/webinars - Get all webinars (Admin only)
+app.get('/api/webinars', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const webinars = await db.all(
+      'SELECT * FROM webinars ORDER BY start_time DESC'
+    );
+
+    res.json({
+      success: true,
+      webinars: webinars.map(web => ({
+        ...web,
+        attendee_emails: JSON.parse(web.attendee_emails || '[]')
+      }))
+    });
+
+  } catch (error) {
+    console.error('Error fetching webinars:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching webinars'
+    });
+  }
+});
+
+// PUT /api/webinars/:id - Update webinar (Admin only)
+app.put('/api/webinars/:id', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+
+    // Build dynamic update query
+    const allowedFields = [
+      'title', 'description', 'start_time', 'end_time', 'duration_minutes',
+      'max_attendees', 'price', 'is_free', 'attendee_emails', 'meeting_notes', 'status'
+    ];
+
+    const updateFields = [];
+    const values = [];
+
+    for (const field of allowedFields) {
+      if (updates[field] !== undefined) {
+        updateFields.push(`${field} = ?`);
+        if (field === 'attendee_emails') {
+          values.push(JSON.stringify(updates[field]));
+        } else if (field === 'is_free') {
+          values.push(updates[field] ? 1 : 0);
+        } else {
+          values.push(updates[field]);
+        }
+      }
+    }
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid fields to update'
+      });
+    }
+
+    values.push(id);
+
+    await db.run(
+      `UPDATE webinars SET ${updateFields.join(', ')} WHERE id = ?`,
+      ...values
+    );
+
+    res.json({
+      success: true,
+      message: 'Webinar updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Error updating webinar:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error updating webinar'
+    });
+  }
+});
+
+// DELETE /api/webinars/:id - Delete webinar (Admin only)
+app.delete('/api/webinars/:id', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await db.run('DELETE FROM webinars WHERE id = ?', [id]);
+
+    res.json({
+      success: true,
+      message: 'Webinar deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Error deleting webinar:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error deleting webinar'
+    });
+  }
+});
+
+// GET /api/webinars/public - Get upcoming webinars (Public endpoint)
+app.get('/api/webinars/public', async (req, res) => {
+  try {
+    const webinars = await db.all(
+      `SELECT * FROM webinars
+       WHERE status = 'scheduled' AND start_time > datetime('now')
+       ORDER BY start_time ASC`
+    );
+
+    res.json({
+      success: true,
+      webinars: webinars.map(web => ({
+        ...web,
+        attendee_emails: JSON.parse(web.attendee_emails || '[]')
+      }))
+    });
+
+  } catch (error) {
+    console.error('Error fetching public webinars:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching webinars'
+    });
+  }
+});
+
+// GET /api/consultants/:id/availability - Get consultant's available time slots
+app.get('/api/consultants/:id/availability', async (req, res) => {
+  try {
+    const consultantId = req.params.id;
+    const { date } = req.query;
+
+    if (!date) {
+      return res.status(400).json({
+        success: false,
+        message: 'Date parameter is required'
+      });
+    }
+
+    // Get consultant's availability for the specific date
+    const availability = await db.all(
+      'SELECT * FROM consultant_availability WHERE consultant_id = ? AND date = ?',
+      [consultantId, date]
+    );
+
+    // Get existing appointments for the date
+    const appointments = await db.all(
+      'SELECT start_time, end_time FROM appointments WHERE consultant_id = ? AND DATE(start_time) = ? AND status IN (?, ?)',
+      [consultantId, date, 'scheduled', 'confirmed']
+    );
+
+    res.json({
+      success: true,
+      availability,
+      booked_slots: appointments
+    });
+
+  } catch (error) {
+    console.error('Error fetching consultant availability:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching availability'
+    });
+  }
+});
+
 // --- Start server ---
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, async () => {
@@ -2369,6 +3775,152 @@ app.post('/submit-form', (req, res) => {
 app.get('/api/consultants/public', async (req, res) => {
   const consultants = await db.all('SELECT * FROM consultants');
   res.json(consultants);
+});
+
+// POST /api/consultations/public - Create consultation booking (Public endpoint for external users)
+app.post('/api/consultations/public', async (req, res) => {
+  try {
+    const {
+      consultant_id,
+      title,
+      description,
+      start_time,
+      end_time,
+      duration_minutes,
+      attendee_emails,
+      notes,
+      price,
+      user_name,
+      user_email,
+      user_phone
+    } = req.body;
+
+    // Validate required fields
+    if (!consultant_id || !title || !start_time || !end_time || !duration_minutes || !user_name || !user_email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: consultant_id, title, start_time, end_time, duration_minutes, user_name, user_email are required'
+      });
+    }
+
+    // Check if consultant exists
+    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', consultant_id);
+    if (!consultant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Consultant not found'
+      });
+    }
+
+    // Generate appointment ID
+    const appointmentId = generateAppointmentId();
+
+    // Create appointment in database (user_id will be null for external users)
+    const result = await db.run(
+      `INSERT INTO appointments (
+        appointment_id, consultant_id, user_id, title, description,
+        start_time, end_time, duration_minutes, meeting_type,
+        attendee_emails, notes, price, status, payment_status,
+        user_name, user_email, user_phone
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        appointmentId, consultant_id, null, title, description,
+        start_time, end_time, duration_minutes, 'consultation',
+        JSON.stringify(attendee_emails || []), notes, price || 0,
+        'scheduled', 'pending', user_name, user_email, user_phone
+      ]
+    );
+
+    // Initialize Google Meet link variable
+    let googleMeetLink = null;
+    let googleEventId = null;
+
+    // Get Google Calendar client for admin (since external users don't have calendar access)
+    try {
+      const adminUserId = 1; // Assuming admin user ID is 1, or get from environment
+      const calendarClient = await getGoogleCalendarClient(adminUserId, 'admin');
+
+      // Create Google Meet event
+      const eventDetails = {
+        title: title,
+        description: description || '',
+        startTime: start_time,
+        endTime: end_time,
+        timezone: 'Asia/Kolkata',
+        attendees: [
+          { email: user_email },
+          ...(attendee_emails || []).map(email => ({ email }))
+        ]
+      };
+
+      const googleEvent = await createGoogleMeetEvent(calendarClient, eventDetails);
+
+      // Store Google Meet details
+      googleMeetLink = googleEvent.conferenceData?.entryPoints?.[0]?.uri;
+      googleEventId = googleEvent.id;
+
+      // Update appointment with Google Meet details
+      await db.run(
+        'UPDATE appointments SET google_meet_link = ?, google_calendar_event_id = ? WHERE id = ?',
+        [googleMeetLink, googleEventId, result.lastID]
+      );
+
+    } catch (googleError) {
+      console.error('Google Calendar error:', googleError);
+      // Don't fail the request if Google Calendar fails, just log it
+    }
+
+    // Send email notifications
+    try {
+      const emailSubject = `Consultation Scheduled: ${title}`;
+      const emailHtml = `
+        <h2>Consultation Scheduled Successfully</h2>
+        <p><strong>Title:</strong> ${title}</p>
+        <p><strong>Consultant:</strong> ${consultant.name}</p>
+        <p><strong>Date & Time:</strong> ${new Date(start_time).toLocaleString()}</p>
+        <p><strong>Duration:</strong> ${duration_minutes} minutes</p>
+        <p><strong>Price:</strong> ₹${price || 0}</p>
+        ${googleMeetLink ? `<p><strong>Google Meet Link:</strong> <a href="${googleMeetLink}">Join Meeting</a></p>` : ''}
+        ${description ? `<p><strong>Description:</strong> ${description}</p>` : ''}
+        ${notes ? `<p><strong>Notes:</strong> ${notes}</p>` : ''}
+        <p><strong>Contact Information:</strong></p>
+        <p>Name: ${user_name}</p>
+        <p>Email: ${user_email}</p>
+        ${user_phone ? `<p>Phone: ${user_phone}</p>` : ''}
+      `;
+
+      // Send to user
+      await sendEmailNotification(user_email, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+
+      // Send to consultant
+      if (consultant.email) {
+        await sendEmailNotification(consultant.email, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+      }
+
+      // Send to attendees
+      if (attendee_emails && attendee_emails.length > 0) {
+        await sendEmailNotification(attendee_emails, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+      }
+
+    } catch (emailError) {
+      console.error('Email notification error:', emailError);
+      // Don't fail the request if email fails, just log it
+    }
+
+    res.json({
+      success: true,
+      message: 'Consultation booked successfully! You will receive an email confirmation with the Google Meet link.',
+      appointment_id: appointmentId,
+      google_meet_link: googleMeetLink
+    });
+
+  } catch (error) {
+    console.error('Error creating consultation:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error scheduling consultation'
+    });
+  }
 });
 
 // --- Products API with File Uploads ---
@@ -2670,12 +4222,40 @@ async function ensureEcommerceTables() {
         first_name TEXT NOT NULL,
         last_name TEXT NOT NULL,
         email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
+        password_hash TEXT,
         phone TEXT,
+        google_id TEXT UNIQUE,
+        is_verified BOOLEAN DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
     `);
+
+    // Add missing columns to existing users_auth table if they don't exist
+    try {
+      await db.exec(`
+        ALTER TABLE users_auth ADD COLUMN google_id TEXT UNIQUE;
+      `);
+    } catch (error) {
+      // Column already exists, ignore error
+    }
+
+    try {
+      await db.exec(`
+        ALTER TABLE users_auth ADD COLUMN is_verified BOOLEAN DEFAULT 0;
+      `);
+    } catch (error) {
+      // Column already exists, ignore error
+    }
+
+    // Make password_hash nullable for Google OAuth users
+    try {
+      await db.exec(`
+        ALTER TABLE users_auth ALTER COLUMN password_hash DROP NOT NULL;
+      `);
+    } catch (error) {
+      // SQLite doesn't support ALTER COLUMN, this is expected
+    }
 
     // Create user addresses table
     await db.exec(`
@@ -3936,5 +5516,138 @@ app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
+
+// --- Consultant Dashboard API Endpoints ---
+
+// Get consultant profile
+app.get('/api/consultants/profile', authenticateToken, async (req, res) => {
+  try {
+    const consultant = await db.get('SELECT * FROM consultants WHERE user_id = ?', [req.user.id]);
+    if (!consultant) {
+      return res.status(404).json({ error: 'Consultant profile not found' });
+    }
+    res.json(consultant);
+  } catch (error) {
+    console.error('Error fetching consultant profile:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get consultant appointments
+app.get('/api/consultants/appointments', authenticateToken, async (req, res) => {
+  try {
+    const consultant = await db.get('SELECT * FROM consultants WHERE user_id = ?', [req.user.id]);
+    if (!consultant) {
+      return res.status(404).json({ error: 'Consultant profile not found' });
+    }
+
+    const appointments = await db.all(`
+      SELECT a.*, u.first_name as user_name, u.email as user_email, u.phone as user_phone
+      FROM appointments a
+      LEFT JOIN users_auth u ON a.user_id = u.id
+      WHERE a.consultant_id = ?
+      ORDER BY a.start_time DESC
+    `, [consultant.id]);
+
+    res.json({ appointments });
+  } catch (error) {
+    console.error('Error fetching consultant appointments:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get consultant webinars
+app.get('/api/consultants/webinars', authenticateToken, async (req, res) => {
+  try {
+    const consultant = await db.get('SELECT * FROM consultants WHERE user_id = ?', [req.user.id]);
+    if (!consultant) {
+      return res.status(404).json({ error: 'Consultant profile not found' });
+    }
+
+    const webinars = await db.all(`
+      SELECT * FROM webinars
+      WHERE organizer_email = ?
+      ORDER BY start_time DESC
+    `, [consultant.email]);
+
+    res.json({ webinars });
+  } catch (error) {
+    console.error('Error fetching consultant webinars:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get consultant availability
+app.get('/api/consultants/availability', authenticateToken, async (req, res) => {
+  try {
+    const consultant = await db.get('SELECT * FROM consultants WHERE user_id = ?', [req.user.id]);
+    if (!consultant) {
+      return res.status(404).json({ error: 'Consultant profile not found' });
+    }
+
+    const availability = await db.all(`
+      SELECT * FROM consultant_availability
+      WHERE consultant_id = ?
+      ORDER BY date, start_time
+    `, [consultant.id]);
+
+    res.json({ availability });
+  } catch (error) {
+    console.error('Error fetching consultant availability:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add consultant availability
+app.post('/api/consultants/availability', authenticateToken, async (req, res) => {
+  try {
+    const consultant = await db.get('SELECT * FROM consultants WHERE user_id = ?', [req.user.id]);
+    if (!consultant) {
+      return res.status(404).json({ error: 'Consultant profile not found' });
+    }
+
+    const { date, start_time, end_time } = req.body;
+
+    const result = await db.run(`
+      INSERT INTO consultant_availability (consultant_id, date, start_time, end_time)
+      VALUES (?, ?, ?, ?)
+    `, [consultant.id, date, start_time, end_time]);
+
+    res.json({
+      id: result.lastID,
+      consultant_id: consultant.id,
+      date,
+      start_time,
+      end_time
+    });
+  } catch (error) {
+    console.error('Error adding consultant availability:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete consultant availability
+app.delete('/api/consultants/availability/:id', authenticateToken, async (req, res) => {
+  try {
+    const consultant = await db.get('SELECT * FROM consultants WHERE user_id = ?', [req.user.id]);
+    if (!consultant) {
+      return res.status(404).json({ error: 'Consultant profile not found' });
+    }
+
+    const { id } = req.params;
+
+    await db.run(`
+      DELETE FROM consultant_availability
+      WHERE id = ? AND consultant_id = ?
+    `, [id, consultant.id]);
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error deleting consultant availability:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// --- End Consultant Dashboard API Endpoints ---
 
 
