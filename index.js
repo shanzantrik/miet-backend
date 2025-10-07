@@ -12,6 +12,11 @@ import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
 import nodemailer from 'nodemailer';
 import { v4 as uuidv4 } from 'uuid';
+import dotenv from 'dotenv';
+import Razorpay from 'razorpay';
+
+// Load environment variables
+dotenv.config();
 
 
 const app = express();
@@ -59,6 +64,17 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your_jwt_secret_change_in_producti
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 const PAYMENT_GATEWAY_API_KEY = process.env.PAYMENT_GATEWAY_API_KEY || 'test_key';
 const PAYMENT_GATEWAY_SECRET = process.env.PAYMENT_GATEWAY_SECRET || 'test_secret';
+
+// Razorpay Configuration
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'your_razorpay_key_id_here';
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || 'your_razorpay_key_secret_here';
+
+// Initialize Razorpay instance
+const razorpay = new Razorpay({
+  key_id: RAZORPAY_KEY_ID,
+  key_secret: RAZORPAY_KEY_SECRET,
+});
+
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = process.env.SMTP_PORT || 587;
 const SMTP_USER = process.env.SMTP_USER || 'shaanjyot13@gmail.com';
@@ -385,7 +401,7 @@ async function setupDatabase() {
       end_time DATETIME NOT NULL,
       duration_minutes INTEGER NOT NULL,
       meeting_type TEXT CHECK(meeting_type IN ('consultation', 'webinar')) NOT NULL,
-      status TEXT CHECK(status IN ('scheduled', 'confirmed', 'cancelled', 'completed', 'no_show')) DEFAULT 'scheduled',
+      status TEXT CHECK(status IN ('scheduled', 'confirmed', 'cancelled', 'completed', 'no_show', 'payment_pending')) DEFAULT 'scheduled',
       google_meet_link TEXT,
       google_calendar_event_id TEXT,
       price REAL,
@@ -400,6 +416,20 @@ async function setupDatabase() {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY(consultant_id) REFERENCES consultants(id),
       FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS appointment_payments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      appointment_id INTEGER NOT NULL,
+      razorpay_order_id TEXT NOT NULL,
+      razorpay_payment_id TEXT,
+      razorpay_signature TEXT,
+      amount REAL NOT NULL,
+      currency TEXT DEFAULT 'INR',
+      status TEXT CHECK(status IN ('pending', 'completed', 'failed', 'refunded')) DEFAULT 'pending',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(appointment_id) REFERENCES appointments(id)
     );
 
     CREATE TABLE IF NOT EXISTS webinars (
@@ -546,6 +576,89 @@ async function setupDatabase() {
     }
   } catch (error) {
     console.error('Error migrating users table:', error);
+    // Don't throw error, just log it so the main process continues
+  }
+
+  // --- MIGRATION: Update appointments table to support 'payment_pending' status ---
+  try {
+    const appointmentsTableInfo = await db.all("PRAGMA table_info(appointments)");
+    const hasStatusColumn = appointmentsTableInfo.some(col => col.name === 'status');
+
+    if (hasStatusColumn) {
+      // Check if the constraint already includes 'payment_pending' status
+      const tableSchema = await db.get("SELECT sql FROM sqlite_master WHERE type='table' AND name='appointments'");
+      if (tableSchema && !tableSchema.sql.includes("'payment_pending'")) {
+        console.log('Migrating appointments table to support "payment_pending" status...');
+
+        // Check if appointments_new table already exists and drop it if it does
+        const existingNewTable = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='appointments_new'");
+        if (existingNewTable) {
+          console.log('Dropping existing appointments_new table...');
+          await db.exec('DROP TABLE appointments_new;');
+        }
+
+        // Create a new table with the updated constraint
+        await db.exec(`
+          CREATE TABLE appointments_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            appointment_id TEXT UNIQUE NOT NULL,
+            consultant_id INTEGER,
+            user_id INTEGER,
+            title TEXT NOT NULL,
+            description TEXT,
+            start_time DATETIME NOT NULL,
+            end_time DATETIME NOT NULL,
+            duration_minutes INTEGER NOT NULL,
+            meeting_type TEXT CHECK(meeting_type IN ('consultation', 'webinar')) NOT NULL,
+            status TEXT CHECK(status IN ('scheduled', 'confirmed', 'cancelled', 'completed', 'no_show', 'payment_pending')) DEFAULT 'scheduled',
+            google_meet_link TEXT,
+            google_calendar_event_id TEXT,
+            price REAL,
+            payment_status TEXT CHECK(payment_status IN ('pending', 'paid', 'refunded')) DEFAULT 'pending',
+            payment_id TEXT,
+            attendee_emails TEXT,
+            notes TEXT,
+            user_name TEXT,
+            user_email TEXT,
+            user_phone TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(consultant_id) REFERENCES consultants(id),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+          );
+        `);
+
+        // Copy data from old table to new table
+        await db.exec(`
+          INSERT INTO appointments_new (
+            id, appointment_id, consultant_id, user_id, title, description,
+            start_time, end_time, duration_minutes, meeting_type, status,
+            google_meet_link, google_calendar_event_id, price, payment_status,
+            payment_id, attendee_emails, notes, user_name, user_email, user_phone,
+            created_at, updated_at
+          )
+          SELECT
+            id, appointment_id, consultant_id, user_id, title, description,
+            start_time, end_time, duration_minutes, meeting_type, status,
+            google_meet_link, google_calendar_event_id, price, payment_status,
+            payment_id, attendee_emails, notes, user_name, user_email, user_phone,
+            created_at, updated_at
+          FROM appointments;
+        `);
+
+        // Drop old table and rename new table
+        await db.exec('DROP TABLE appointments;');
+        await db.exec('ALTER TABLE appointments_new RENAME TO appointments;');
+
+        console.log('Appointments table migration completed successfully.');
+      } else {
+        console.log('Appointments table already supports "payment_pending" status.');
+      }
+    } else {
+      console.log('Appointments table does not have status column, skipping migration.');
+    }
+  } catch (error) {
+    console.error('Error migrating appointments table:', error);
     // Don't throw error, just log it so the main process continues
   }
 }
@@ -2467,6 +2580,465 @@ app.get('/api/payments/:paymentId/status', authenticateUser, async (req, res) =>
   }
 });
 
+// --- Razorpay Payment Integration API ---
+
+// POST /api/razorpay/create-order - Create Razorpay order (authenticated)
+app.post('/api/razorpay/create-order', authenticateUser, async (req, res) => {
+  try {
+    const { amount, currency = 'INR', receipt } = req.body;
+
+    // Validation
+    if (!amount || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Valid amount is required'
+      });
+    }
+
+    // Convert amount to paise (Razorpay expects amount in smallest currency unit)
+    const amountInPaise = Math.round(amount * 100);
+
+    // Create Razorpay order
+    const orderOptions = {
+      amount: amountInPaise,
+      currency: currency,
+      receipt: receipt || `receipt_${Date.now()}`,
+      payment_capture: 1 // Auto capture payment
+    };
+
+    const razorpayOrder = await razorpay.orders.create(orderOptions);
+
+    res.json({
+      success: true,
+      message: 'Razorpay order created successfully',
+      order: {
+        id: razorpayOrder.id,
+        amount: razorpayOrder.amount,
+        currency: razorpayOrder.currency,
+        receipt: razorpayOrder.receipt,
+        status: razorpayOrder.status
+      }
+    });
+
+  } catch (error) {
+    console.error('Error creating Razorpay order:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating Razorpay order',
+      error: error.message
+    });
+  }
+});
+
+// POST /api/razorpay/verify-payment - Verify Razorpay payment
+app.post('/api/razorpay/verify-payment', authenticateUser, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+    // Validation
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({
+        success: false,
+        message: 'Razorpay order ID, payment ID, and signature are required'
+      });
+    }
+
+    // Verify payment signature
+    const crypto = require('crypto');
+    const expectedSignature = crypto
+      .createHmac('sha256', RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest('hex');
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid payment signature'
+      });
+    }
+
+    // Get payment details from Razorpay
+    const payment = await razorpay.payments.fetch(razorpay_payment_id);
+
+    res.json({
+      success: true,
+      message: 'Payment verified successfully',
+      payment: {
+        id: payment.id,
+        order_id: payment.order_id,
+        amount: payment.amount,
+        currency: payment.currency,
+        status: payment.status,
+        method: payment.method,
+        created_at: payment.created_at
+      }
+    });
+
+  } catch (error) {
+    console.error('Error verifying Razorpay payment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error verifying Razorpay payment',
+      error: error.message
+    });
+  }
+});
+
+// POST /api/razorpay/webhook - Handle Razorpay webhooks
+app.post('/api/razorpay/webhook', async (req, res) => {
+  try {
+    const body = req.body;
+    const signature = req.headers['x-razorpay-signature'];
+
+    // Verify webhook signature
+    const crypto = require('crypto');
+    const expectedSignature = crypto
+      .createHmac('sha256', RAZORPAY_KEY_SECRET)
+      .update(JSON.stringify(body))
+      .digest('hex');
+
+    if (expectedSignature !== signature) {
+      console.log('Invalid webhook signature');
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid webhook signature'
+      });
+    }
+
+    const event = body.event;
+    const payment = body.payload.payment.entity;
+
+    console.log('Razorpay webhook received:', event, payment.id);
+
+    // Handle different webhook events
+    switch (event) {
+      case 'payment.captured':
+        // Payment was successful
+        await db.run(`
+          UPDATE payments
+          SET status = 'completed', gateway_response = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE transaction_id = ?
+        `, [JSON.stringify(payment), payment.id]);
+
+        // Update order status
+        await db.run(`
+          UPDATE orders_new
+          SET payment_status = 'paid', updated_at = CURRENT_TIMESTAMP
+          WHERE id = (SELECT order_id FROM payments WHERE transaction_id = ?)
+        `, [payment.id]);
+        break;
+
+      case 'payment.failed':
+        // Payment failed
+        await db.run(`
+          UPDATE payments
+          SET status = 'failed', gateway_response = ?, updated_at = CURRENT_TIMESTAMP
+          WHERE transaction_id = ?
+        `, [JSON.stringify(payment), payment.id]);
+
+        // Update order status
+        await db.run(`
+          UPDATE orders_new
+          SET payment_status = 'failed', updated_at = CURRENT_TIMESTAMP
+          WHERE id = (SELECT order_id FROM payments WHERE transaction_id = ?)
+        `, [payment.id]);
+        break;
+
+      default:
+        console.log('Unhandled webhook event:', event);
+    }
+
+    res.json({
+      success: true,
+      message: 'Webhook processed successfully'
+    });
+
+  } catch (error) {
+    console.error('Error processing Razorpay webhook:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error processing webhook',
+      error: error.message
+    });
+  }
+});
+
+// GET /api/razorpay/key - Get Razorpay key ID for frontend
+app.get('/api/razorpay/key', (req, res) => {
+  res.json({
+    success: true,
+    key_id: RAZORPAY_KEY_ID
+  });
+});
+
+// --- Payment-First Appointment Booking API ---
+
+// POST /api/appointments/payment-first - Create appointment with payment first
+app.post('/api/appointments/payment-first', authenticateToken, async (req, res) => {
+  try {
+    const {
+      consultant_id,
+      title,
+      description,
+      start_time,
+      end_time,
+      duration_minutes,
+      attendee_emails,
+      notes,
+      price,
+      user_name,
+      user_email,
+      user_phone,
+      payment_method = 'razorpay'
+    } = req.body;
+
+    // Validate required fields
+    if (!consultant_id || !title || !start_time || !end_time || !duration_minutes || !user_name || !user_email || !price) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields: consultant_id, title, start_time, end_time, duration_minutes, user_name, user_email, price are required'
+      });
+    }
+
+    // Check if consultant exists
+    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', consultant_id);
+    if (!consultant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Consultant not found'
+      });
+    }
+
+    // Generate appointment ID
+    const appointmentId = generateAppointmentId();
+
+    // Create appointment in database with 'payment_pending' status
+    const result = await db.run(
+      `INSERT INTO appointments (
+        appointment_id, consultant_id, user_id, title, description,
+        start_time, end_time, duration_minutes, meeting_type,
+        attendee_emails, notes, price, status, payment_status,
+        user_name, user_email, user_phone
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        appointmentId, consultant_id, null, title, description,
+        start_time, end_time, duration_minutes, 'consultation',
+        JSON.stringify(attendee_emails || []), notes, price,
+        'payment_pending', 'pending', user_name, user_email, user_phone
+      ]
+    );
+
+    const appointmentDbId = result.lastID;
+
+    // Create Razorpay order for the appointment
+    const amountInPaise = Math.round(price * 100);
+    const orderOptions = {
+      amount: amountInPaise,
+      currency: 'INR',
+      receipt: `appointment_${appointmentId}`,
+      payment_capture: 1,
+      notes: {
+        appointment_id: appointmentId,
+        consultant_name: consultant.name,
+        appointment_title: title
+      }
+    };
+
+    console.log('Creating Razorpay order with options:', orderOptions);
+    console.log('Razorpay instance key_id:', RAZORPAY_KEY_ID);
+    console.log('Razorpay instance key_secret:', RAZORPAY_KEY_SECRET ? 'SET' : 'NOT SET');
+
+    const razorpayOrder = await razorpay.orders.create(orderOptions);
+    console.log('Razorpay order created successfully:', razorpayOrder.id);
+
+    // Store payment order details in database
+    await db.run(
+      `INSERT INTO appointment_payments (
+        appointment_id, razorpay_order_id, amount, currency, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
+      [appointmentDbId, razorpayOrder.id, price, 'INR', 'pending']
+    );
+
+    res.json({
+      success: true,
+      message: 'Appointment created. Please complete payment to confirm booking.',
+      appointment_id: appointmentId,
+      appointment_db_id: appointmentDbId,
+      payment_order: {
+        id: razorpayOrder.id,
+        amount: razorpayOrder.amount,
+        currency: razorpayOrder.currency,
+        receipt: razorpayOrder.receipt
+      },
+      consultant: {
+        name: consultant.name,
+        email: consultant.email
+      }
+    });
+
+  } catch (error) {
+    console.error('Error creating payment-first appointment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error creating appointment',
+      error: error.message,
+      stack: error.stack
+    });
+  }
+});
+
+// POST /api/appointments/confirm-payment - Confirm appointment after successful payment
+app.post('/api/appointments/confirm-payment', async (req, res) => {
+  try {
+    const {
+      appointment_id,
+      razorpay_order_id,
+      razorpay_payment_id,
+      razorpay_signature
+    } = req.body;
+
+    // Validate required fields
+    if (!appointment_id || !razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required payment verification fields'
+      });
+    }
+
+    // Verify payment signature
+    const crypto = require('crypto');
+    const expectedSignature = crypto
+      .createHmac('sha256', RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest('hex');
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid payment signature'
+      });
+    }
+
+    // Get appointment details
+    const appointment = await db.get('SELECT * FROM appointments WHERE appointment_id = ?', appointment_id);
+    if (!appointment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Appointment not found'
+      });
+    }
+
+    // Get consultant details
+    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', appointment.consultant_id);
+    if (!consultant) {
+      return res.status(404).json({
+        success: false,
+        message: 'Consultant not found'
+      });
+    }
+
+    // Update appointment status to confirmed
+    await db.run(
+      'UPDATE appointments SET status = ?, payment_status = ? WHERE appointment_id = ?',
+      ['scheduled', 'paid', appointment_id]
+    );
+
+    // Update payment record
+    await db.run(
+      `UPDATE appointment_payments
+       SET razorpay_payment_id = ?, razorpay_signature = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE appointment_id = ? AND razorpay_order_id = ?`,
+      [razorpay_payment_id, razorpay_signature, 'completed', appointment.id, razorpay_order_id]
+    );
+
+    // Now create Google Meet event since payment is confirmed
+    let googleMeetLink = null;
+    let googleEventId = null;
+
+    try {
+      const adminUserId = 1; // Admin user ID for calendar access
+      const calendarClient = await getGoogleCalendarClient(adminUserId, 'admin');
+
+      const eventDetails = {
+        title: appointment.title,
+        description: appointment.description || '',
+        startTime: appointment.start_time,
+        endTime: appointment.end_time,
+        timezone: 'Asia/Kolkata',
+        attendees: [
+          { email: appointment.user_email },
+          ...(JSON.parse(appointment.attendee_emails || '[]')).map(email => ({ email }))
+        ]
+      };
+
+      const googleEvent = await createGoogleMeetEvent(calendarClient, eventDetails);
+      googleMeetLink = googleEvent.conferenceData?.entryPoints?.[0]?.uri;
+      googleEventId = googleEvent.id;
+
+      // Update appointment with Google Meet details
+      await db.run(
+        'UPDATE appointments SET google_meet_link = ?, google_calendar_event_id = ? WHERE appointment_id = ?',
+        [googleMeetLink, googleEventId, appointment_id]
+      );
+
+    } catch (googleError) {
+      console.error('Google Calendar error:', googleError);
+      // Don't fail the request if Google Calendar fails, just log it
+    }
+
+    // Send confirmation email
+    try {
+      const emailSubject = `Appointment Confirmed: ${appointment.title}`;
+      const emailHtml = `
+        <h2>Appointment Confirmed Successfully!</h2>
+        <p><strong>Title:</strong> ${appointment.title}</p>
+        <p><strong>Consultant:</strong> ${consultant.name}</p>
+        <p><strong>Date & Time:</strong> ${new Date(appointment.start_time).toLocaleString()}</p>
+        <p><strong>Duration:</strong> ${appointment.duration_minutes} minutes</p>
+        <p><strong>Price:</strong> ₹${appointment.price}</p>
+        ${googleMeetLink ? `<p><strong>Google Meet Link:</strong> <a href="${googleMeetLink}">Join Meeting</a></p>` : ''}
+        ${appointment.description ? `<p><strong>Description:</strong> ${appointment.description}</p>` : ''}
+        ${appointment.notes ? `<p><strong>Notes:</strong> ${appointment.notes}</p>` : ''}
+        <p><strong>Payment Status:</strong> Completed</p>
+        <p>Thank you for your payment. Your appointment has been confirmed!</p>
+      `;
+
+      // Send to user
+      await sendEmailNotification(appointment.user_email, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+
+      // Send to consultant
+      if (consultant.email) {
+        await sendEmailNotification(consultant.email, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+      }
+
+      // Send to attendees
+      const attendeeEmails = JSON.parse(appointment.attendee_emails || '[]');
+      if (attendeeEmails.length > 0) {
+        await sendEmailNotification(attendeeEmails, emailSubject, emailHtml, emailHtml.replace(/<[^>]*>/g, ''));
+      }
+
+    } catch (emailError) {
+      console.error('Email notification error:', emailError);
+    }
+
+    res.json({
+      success: true,
+      message: 'Payment confirmed and appointment scheduled successfully!',
+      appointment_id: appointment_id,
+      google_meet_link: googleMeetLink,
+      payment_status: 'completed'
+    });
+
+  } catch (error) {
+    console.error('Error confirming appointment payment:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error confirming payment',
+      error: error.message
+    });
+  }
+});
+
 // --- Inventory Management API ---
 
 // GET /api/inventory/check - Check product availability
@@ -3771,11 +4343,7 @@ app.post('/submit-form', (req, res) => {
 });
 
 // --- Consultant Public API ---
-// Get all consultants (public, no auth)
-app.get('/api/consultants/public', async (req, res) => {
-  const consultants = await db.all('SELECT * FROM consultants');
-  res.json(consultants);
-});
+// Note: /api/consultants/public endpoint is already defined above with proper location formatting
 
 // POST /api/consultations/public - Create consultation booking (Public endpoint for external users)
 app.post('/api/consultations/public', async (req, res) => {
