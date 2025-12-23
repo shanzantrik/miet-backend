@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "../miet"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"CodeGPT.apiKey": "CodeGPT Plus Beta"
+	}
+}
