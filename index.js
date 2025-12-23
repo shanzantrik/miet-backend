@@ -4521,7 +4521,10 @@ async function ensureProductsTableV2() {
         // New course-specific fields
         'subtitle', 'instructor_name', 'instructor_title', 'instructor_bio',
         'instructor_image', 'duration', 'total_lectures', 'language', 'level',
-        'rating', 'total_ratings', 'enrolled_students'
+        'rating', 'total_ratings', 'enrolled_students',
+        // New common and specific fields
+        'category', 'format', 'total_pages', 'preview_file', 'platform', 'version',
+        'app_size', 'brand', 'model', 'warranty', 'specifications', 'stock_quantity', 'images'
       ];
 
       const missingColumns = requiredColumns.filter(col => !columnNames.includes(col));
@@ -4589,7 +4592,20 @@ async function ensureProductsTableV2() {
           level TEXT DEFAULT 'Beginner',
           rating REAL DEFAULT 0.00,
           total_ratings INTEGER DEFAULT 0,
-          enrolled_students INTEGER DEFAULT 0
+          enrolled_students INTEGER DEFAULT 0,
+          category TEXT,
+          format TEXT,
+          total_pages INTEGER,
+          preview_file TEXT,
+          platform TEXT,
+          version TEXT,
+          app_size TEXT,
+          brand TEXT,
+          model TEXT,
+          warranty TEXT,
+          specifications TEXT,
+          stock_quantity INTEGER DEFAULT 0,
+          images TEXT
     );
   `);
       console.log('Products table created with complete schema including course fields');
@@ -5249,15 +5265,8 @@ app.post('/api/products', productUpload.fields([
       validationError = 'Price must be "Free" or a valid number';
     }
 
-    // Validate learning objectives (optional for now, max 20 items)
-    if (data.learning_objectives && (!Array.isArray(data.learning_objectives) || data.learning_objectives.length > 20)) {
-      validationError = 'Learning objectives must be an array with maximum 20 items';
-    }
-
-    // Validate requirements (optional, max 20 items)
-    if (data.requirements && (!Array.isArray(data.requirements) || data.requirements.length > 20)) {
-      validationError = 'Requirements must be an array with maximum 20 items';
-    }
+    // Relaxed validation for learning objectives and requirements
+    // (Conversion to array handled during processing)
 
     // Validate course content (optional, max 50 sections)
     if (data.course_content && (!Array.isArray(data.course_content) || data.course_content.length > 50)) {
@@ -5297,42 +5306,90 @@ app.post('/api/products', productUpload.fields([
   }
 
   try {
-    // Prepare data for insertion
+    // Prepare data for insertion (supporting both snake_case and camelCase)
     const title = data.title || null;
-    const name = data.name || null;
+    const name = data.name || data.productName || null; // Support name or productName
     const description = data.description || null;
-    const price = data.price === 'Free' ? null : (data.price ? parseFloat(data.price) : null);
-    const video_url = data.video_url || null;
-    const author = data.author || null;
-    const purchase_link = data.purchase_link || null;
-    const download_link = data.download_link || null;
+    const price = (data.price === 'Free' || data.price === 0) ? 0 : (data.price ? parseFloat(data.price) : 0);
+    const video_url = data.video_url || data.videoPreviewUrl || null;
+    const author = data.author || data.developerName || null;
+    const purchase_link = data.purchase_link || data.purchaseLink || null;
+    const download_link = data.download_link || data.downloadLink || null;
     const status = data.status || 'active';
-    const featured = data.featured === 'true' || data.featured === '1' ? 1 : 0;
+
+    // Support 'featured' (existing) OR 'isFeatured' (new)
+    const featured = (data.featured === 'true' || data.featured === '1' || data.featured === 1 ||
+      data.isFeatured === 'true' || data.isFeatured === '1' || data.isFeatured === true ||
+      data.is_featured === 'true' || data.is_featured === '1') ? 1 : 0;
+
+    const category = data.category || null;
 
     // Course-specific fields
     const subtitle = data.subtitle || null;
-    const instructor_name = data.instructor_name || null;
-    const instructor_title = data.instructor_title || null;
-    const instructor_bio = data.instructor_bio || null;
-    const instructor_image = files.instructor_image ? '/uploads/instructors/' + files.instructor_image[0].filename : null;
+    const instructor_name = data.instructor_name || data.instructorName || null;
+    const instructor_title = data.instructor_title || data.instructorTitle || null;
+    const instructor_bio = data.instructor_bio || data.instructorBio || null;
+    const instructor_image = files.instructor_image ? '/uploads/instructors/' + files.instructor_image[0].filename : (data.instructorImage || null);
     const duration = data.duration || null;
-    const total_lectures = data.total_lectures ? parseInt(data.total_lectures) : 0;
+    const total_lectures = data.total_lectures || data.totalLectures ? parseInt(data.total_lectures || data.totalLectures) : 0;
     const language = data.language || null;
     const level = data.level || 'Beginner';
     const rating = data.rating ? parseFloat(data.rating) : 0.00;
-    const total_ratings = data.total_ratings ? parseInt(data.total_ratings) : 0;
-    const enrolled_students = data.enrolled_students ? parseInt(data.enrolled_students) : 0;
+    const total_ratings = data.total_ratings || data.totalRatings ? parseInt(data.total_ratings || data.totalRatings) : 0;
+    const enrolled_students = data.enrolled_students || data.totalEnrollments ? parseInt(data.enrolled_students || data.totalEnrollments) : 0;
+
+    // E-Book specific fields
+    const format = data.format || null;
+    const total_pages = data.total_pages || data.totalPages ? parseInt(data.total_pages || data.totalPages) : null;
+    const preview_file = files.preview_file ? '/uploads/pdfs/' + files.preview_file[0].filename : (data.previewFile || null);
+
+    // App specific fields
+    const platform = data.platform || null;
+    const version = data.version || null;
+    const app_size = data.app_size || data.appSize || null;
+
+    // Gadget specific fields
+    const brand = data.brand || null;
+    const model = data.model || null;
+    const warranty = data.warranty || null;
+    const stock_quantity = data.stock_quantity || data.stockQuantity ? parseInt(data.stock_quantity || data.stockQuantity) : 0;
+
+    // Nested data handling - Objects
+    let specifications = data.specifications || null;
+    if (specifications && typeof specifications === 'object') {
+      specifications = JSON.stringify(specifications);
+    }
+
+    // Nested data handling - Arrays
+    let images = data.images || data.appPreviewImages || null;
+    if (images && Array.isArray(images)) {
+      images = JSON.stringify(images);
+    }
 
     // Handle file uploads with organized directory structure
-    const thumbnail = files.thumbnail ? '/uploads/courses/' + files.thumbnail[0].filename : null;
-    const product_image = files.product_image ? '/uploads/product_images/' + files.product_image[0].filename : null;
-    const icon = files.icon ? '/uploads/icons/' + files.icon[0].filename : null;
-    const pdf_file = files.pdf_file ? '/uploads/pdfs/' + files.pdf_file[0].filename : null;
+    const thumbnail = files.thumbnail ? '/uploads/courses/' + files.thumbnail[0].filename : (data.thumbnail || null);
+    const product_image = files.product_image ? '/uploads/product_images/' + files.product_image[0].filename : (data.product_image || data.coverImage || null);
+    const icon = files.icon ? '/uploads/icons/' + files.icon[0].filename : (data.icon || null);
+    const pdf_file = files.pdf_file ? '/uploads/pdfs/' + files.pdf_file[0].filename : (data.pdf_file || data.downloadableFile || null);
 
     // Insert into database
     const result = await db.run(
-      `INSERT INTO products (product_type, title, name, description, price, video_url, thumbnail, author, pdf_file, product_image, purchase_link, download_link, icon, status, featured, subtitle, instructor_name, instructor_title, instructor_bio, instructor_image, duration, total_lectures, language, level, rating, total_ratings, enrolled_students) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      productType, title, name, description, price, video_url, thumbnail, author, pdf_file, product_image, purchase_link, download_link, icon, status, featured, subtitle, instructor_name, instructor_title, instructor_bio, instructor_image, duration, total_lectures, language, level, rating, total_ratings, enrolled_students
+      `INSERT INTO products (
+        product_type, title, name, description, price, video_url, thumbnail, author, 
+        pdf_file, product_image, purchase_link, download_link, icon, status, featured, 
+        subtitle, instructor_name, instructor_title, instructor_bio, instructor_image, 
+        duration, total_lectures, language, level, rating, total_ratings, enrolled_students,
+        category, format, total_pages, preview_file, platform, version, app_size, 
+        brand, model, warranty, specifications, stock_quantity, images
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        productType, title, name, description, price, video_url, thumbnail, author,
+        pdf_file, product_image, purchase_link, download_link, icon, status, featured,
+        subtitle, instructor_name, instructor_title, instructor_bio, instructor_image,
+        duration, total_lectures, language, level, rating, total_ratings, enrolled_students,
+        category, format, total_pages, preview_file, platform, version, app_size,
+        brand, model, warranty, specifications, stock_quantity, images
+      ]
     );
 
     const productId = result.lastID;
@@ -5341,18 +5398,33 @@ app.post('/api/products', productUpload.fields([
     if (normalizedType === 'course') {
       try {
         // Create learning objectives
-        if (data.learning_objectives && Array.isArray(data.learning_objectives)) {
-          await createLearningObjectives(productId, data.learning_objectives);
+        let learningObjectives = data.learning_objectives || data.learningObjectives || [];
+        if (typeof learningObjectives === 'string') learningObjectives = [learningObjectives];
+        if (Array.isArray(learningObjectives) && learningObjectives.length > 0) {
+          await createLearningObjectives(productId, learningObjectives);
         }
 
         // Create requirements
-        if (data.requirements && Array.isArray(data.requirements)) {
-          await createRequirements(productId, data.requirements);
+        let requirements = data.requirements || data.requirementsData || [];
+        if (typeof requirements === 'string') requirements = [requirements];
+        if (Array.isArray(requirements) && requirements.length > 0) {
+          await createRequirements(productId, requirements);
         }
 
+
         // Create course content structure
-        if (data.course_content && Array.isArray(data.course_content)) {
-          await createCourseContent(productId, data.course_content);
+        const courseContent = data.course_content || data.sections;
+        if (courseContent && Array.isArray(courseContent)) {
+          // Normalize sections if they use camelCase internally
+          const normalizedContent = courseContent.map(section => ({
+            section_name: section.section_name || section.sectionName,
+            lectures: (section.lectures || section.items || []).map(lec => ({
+              lecture_title: lec.lecture_title || lec.lectureTitle
+            })),
+            duration: section.duration || '',
+            order_index: section.order_index !== undefined ? section.order_index : section.order
+          }));
+          await createCourseContent(productId, normalizedContent);
         }
 
         console.log('Course-related data created successfully');
@@ -5430,8 +5502,10 @@ app.get('/api/products', async (req, res) => {
               duration: section.duration,
               items: section.lectures || []
             })),
-            type: product.product_type, // Add type field for frontend compatibility
-            updated_at: product.created_at // Add updated_at for frontend compatibility
+            type: product.product_type,
+            updated_at: product.created_at,
+            specifications: product.specifications ? JSON.parse(product.specifications) : {},
+            images: product.images ? JSON.parse(product.images) : []
           };
         } catch (error) {
           console.error('Error fetching related data for product:', product.id, error);
@@ -5441,14 +5515,18 @@ app.get('/api/products', async (req, res) => {
             requirements: [],
             course_content: [],
             type: product.product_type,
-            updated_at: product.created_at
+            updated_at: product.created_at,
+            specifications: product.specifications ? JSON.parse(product.specifications) : {},
+            images: product.images ? JSON.parse(product.images) : []
           };
         }
       } else {
         return {
           ...product,
           type: product.product_type,
-          updated_at: product.created_at
+          updated_at: product.created_at,
+          specifications: product.specifications ? JSON.parse(product.specifications) : {},
+          images: product.images ? JSON.parse(product.images) : []
         };
       }
     }));
@@ -5504,7 +5582,9 @@ app.get('/api/products/:id', async (req, res) => {
             ...product,
             learning_objectives: learningObjectives,
             requirements: requirements,
-            course_content: courseContent
+            course_content: courseContent,
+            specifications: product.specifications ? JSON.parse(product.specifications) : {},
+            images: product.images ? JSON.parse(product.images) : []
           }
         });
       } catch (error) {
@@ -5517,7 +5597,11 @@ app.get('/api/products/:id', async (req, res) => {
     } else {
       res.json({
         success: true,
-        product: product
+        product: {
+          ...product,
+          specifications: product.specifications ? JSON.parse(product.specifications) : {},
+          images: product.images ? JSON.parse(product.images) : []
+        }
       });
     }
 
@@ -5564,23 +5648,64 @@ app.put('/api/products/:id', productUpload.fields([
     const updateFields = [];
     const updateValues = [];
 
-    // Basic fields
-    const fields = ['title', 'name', 'description', 'price', 'video_url', 'author',
-      'purchase_link', 'download_link', 'status', 'featured', 'subtitle',
-      'instructor_name', 'instructor_title', 'instructor_bio', 'duration',
-      'total_lectures', 'language', 'level', 'rating', 'total_ratings', 'enrolled_students'];
+    // Map of DB column names to possible frontend field names (snake_case and camelCase)
+    const fieldMapping = {
+      title: ['title'],
+      name: ['name', 'productName'],
+      description: ['description'],
+      price: ['price'],
+      video_url: ['video_url', 'videoPreviewUrl'],
+      author: ['author', 'developerName'],
+      purchase_link: ['purchase_link', 'purchaseLink'],
+      download_link: ['download_link', 'downloadLink'],
+      status: ['status'],
+      featured: ['featured', 'isFeatured', 'is_featured'],
+      category: ['category'],
+      subtitle: ['subtitle'],
+      instructor_name: ['instructor_name', 'instructorName'],
+      instructor_title: ['instructor_title', 'instructorTitle'],
+      instructor_bio: ['instructor_bio', 'instructorBio'],
+      duration: ['duration'],
+      total_lectures: ['total_lectures', 'totalLectures'],
+      language: ['language'],
+      level: ['level'],
+      rating: ['rating'],
+      total_ratings: ['total_ratings', 'totalRatings'],
+      enrolled_students: ['enrolled_students', 'totalEnrollments'],
+      format: ['format'],
+      total_pages: ['total_pages', 'totalPages'],
+      platform: ['platform'],
+      version: ['version'],
+      app_size: ['app_size', 'appSize'],
+      brand: ['brand'],
+      model: ['model'],
+      warranty: ['warranty'],
+      stock_quantity: ['stock_quantity', 'stockQuantity'],
+      specifications: ['specifications'],
+      images: ['images', 'appPreviewImages']
+    };
 
-    for (const field of fields) {
-      if (data[field] !== undefined) {
-        let value = data[field];
-        if (field === 'price' && value === 'Free') value = null;
-        if (field === 'total_lectures' || field === 'total_ratings' || field === 'enrolled_students') {
+    for (const [dbField, frontendFields] of Object.entries(fieldMapping)) {
+      // Find the first available frontend field in req.body
+      const frontendField = frontendFields.find(f => data[f] !== undefined);
+
+      if (frontendField !== undefined) {
+        let value = data[frontendField];
+
+        // Data transformations
+        if (dbField === 'price' && (value === 'Free' || value === 0)) value = 0;
+        if (['total_lectures', 'total_ratings', 'enrolled_students', 'total_pages', 'stock_quantity'].includes(dbField)) {
           value = parseInt(value) || 0;
         }
-        if (field === 'rating') value = parseFloat(value) || 0.00;
-        if (field === 'featured') value = value === 'true' || value === '1' ? 1 : 0;
+        if (dbField === 'rating') value = parseFloat(value) || 0.00;
+        if (dbField === 'featured') value = (value === 'true' || value === '1' || value === 1 || value === true) ? 1 : 0;
 
-        updateFields.push(`${field} = ?`);
+        // Handle JSON strings
+        if ((dbField === 'specifications' || dbField === 'images') && typeof value === 'object') {
+          value = JSON.stringify(value);
+        }
+
+        updateFields.push(`${dbField} = ?`);
         updateValues.push(value);
       }
     }
@@ -5617,21 +5742,39 @@ app.put('/api/products/:id', productUpload.fields([
     if (product.product_type === 'course') {
       try {
         // Update learning objectives
-        if (data.learning_objectives && Array.isArray(data.learning_objectives)) {
+        let learningObjectives = data.learning_objectives || data.learningObjectives || [];
+        if (typeof learningObjectives === 'string') learningObjectives = [learningObjectives];
+        if (Array.isArray(learningObjectives)) {
           await deleteLearningObjectives(id);
-          await createLearningObjectives(id, data.learning_objectives);
+          if (learningObjectives.length > 0) {
+            await createLearningObjectives(id, learningObjectives);
+          }
         }
 
         // Update requirements
-        if (data.requirements && Array.isArray(data.requirements)) {
+        let requirements = data.requirements || data.requirementsData || [];
+        if (typeof requirements === 'string') requirements = [requirements];
+        if (Array.isArray(requirements)) {
           await deleteRequirements(id);
-          await createRequirements(id, data.requirements);
+          if (requirements.length > 0) {
+            await createRequirements(id, requirements);
+          }
         }
 
+
         // Update course content
-        if (data.course_content && Array.isArray(data.course_content)) {
+        const courseContent = data.course_content || data.sections;
+        if (courseContent && Array.isArray(courseContent)) {
+          const normalizedContent = courseContent.map(section => ({
+            section_name: section.section_name || section.sectionName,
+            lectures: (section.lectures || section.items || []).map(lec => ({
+              lecture_title: lec.lecture_title || lec.lectureTitle
+            })),
+            duration: section.duration || '',
+            order_index: section.order_index !== undefined ? section.order_index : (section.order || 0)
+          }));
           await deleteCourseContent(id);
-          await createCourseContent(id, data.course_content);
+          await createCourseContent(id, normalizedContent);
         }
 
         console.log('Course-related data updated successfully');
