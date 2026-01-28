@@ -3093,6 +3093,43 @@ app.get('/api/razorpay/key', (req, res) => {
 
 // --- Payment-First Appointment Booking API ---
 
+// GET /api/auth/test-token - Test endpoint to verify JWT decoding (for debugging)
+app.get('/api/auth/test-token', (req, res) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) {
+      return res.json({ success: false, message: 'No token provided' });
+    }
+    
+    // Try backend JWT
+    let backendUser = null;
+    try {
+      backendUser = jwt.verify(token, JWT_SECRET);
+    } catch (e) {
+      // Ignore - will try Supabase
+    }
+    
+    // Try Supabase JWT decode
+    const supabaseDecoded = decodeJwtPayload(token);
+    
+    res.json({
+      success: true,
+      backend_jwt_valid: !!backendUser,
+      backend_user: backendUser,
+      supabase_decoded: supabaseDecoded ? {
+        email: supabaseDecoded.email,
+        exp: supabaseDecoded.exp,
+        expired: supabaseDecoded.exp ? supabaseDecoded.exp * 1000 < Date.now() : null,
+        user_metadata: supabaseDecoded.user_metadata
+      } : null
+    });
+  } catch (error) {
+    res.json({ success: false, error: error.message });
+  }
+});
+
 // POST /api/appointments/payment-first - Create appointment with payment first
 app.post('/api/appointments/payment-first', authenticateToken, async (req, res) => {
   try {
