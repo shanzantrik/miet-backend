@@ -866,9 +866,24 @@ function generateWebinarId() {
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token' });
+  
+  // Check if token exists and is not null/undefined string
+  if (!token || token === 'null' || token === 'undefined') {
+    return res.status(401).json({ 
+      success: false,
+      error: 'Authentication required',
+      message: 'No valid authentication token provided. Please log in to continue.' 
+    });
+  }
+  
   jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) return res.status(403).json({ error: 'Invalid token' });
+    if (err) {
+      return res.status(403).json({ 
+        success: false,
+        error: 'Invalid token',
+        message: 'Invalid or expired authentication token. Please log in again.' 
+      });
+    }
     req.user = user;
     next();
   });
@@ -1090,6 +1105,155 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error during login'
+    });
+  }
+});
+
+// POST /api/auth/supabase-token - Exchange Supabase session for backend JWT
+app.post('/api/auth/supabase-token', async (req, res) => {
+  try {
+    // Ensure database is initialized
+    if (!db) {
+      console.error('Database not initialized');
+      return res.status(500).json({
+        success: false,
+        message: 'Database not available'
+      });
+    }
+
+    // Validate request body
+    if (!req.body || typeof req.body !== 'object') {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid request body'
+      });
+    }
+
+    const { email, supabase_user_id } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email is required'
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid email format'
+      });
+    }
+
+    // Check if user exists in our database, create if not
+    let user;
+    try {
+      user = await db.get('SELECT * FROM users_auth WHERE email = ?', email);
+    } catch (dbError) {
+      console.error('Database query error:', dbError);
+      return res.status(500).json({
+        success: false,
+        message: 'Database error while checking user',
+        error: process.env.NODE_ENV === 'development' ? dbError.message : undefined
+      });
+    }
+
+    if (!user) {
+      // Create new user from Supabase
+      const nameParts = email.split('@')[0].split('.');
+      const first_name = nameParts[0] || '';
+      const last_name = nameParts.slice(1).join(' ') || '';
+
+      try {
+        const result = await db.run(
+          'INSERT INTO users_auth (first_name, last_name, email, is_verified) VALUES (?, ?, ?, ?)',
+          [first_name, last_name, email, 1]
+        );
+
+        if (!result || !result.lastID) {
+          throw new Error('Failed to create user - no ID returned');
+        }
+
+        // Fetch the newly created user to get all fields
+        user = await db.get('SELECT * FROM users_auth WHERE id = ?', result.lastID);
+        
+        if (!user) {
+          throw new Error('Failed to retrieve created user');
+        }
+      } catch (insertError) {
+        console.error('Error creating user:', insertError);
+        
+        // Handle unique constraint violation (user might have been created by another request)
+        if (insertError.message && insertError.message.includes('UNIQUE constraint')) {
+          // User was created between our check and insert, fetch it now
+          try {
+            user = await db.get('SELECT * FROM users_auth WHERE email = ?', email);
+            if (!user) {
+              throw new Error('User exists but could not be retrieved');
+            }
+          } catch (retryError) {
+            console.error('Error retrieving user after constraint violation:', retryError);
+            return res.status(500).json({
+              success: false,
+              message: 'Error retrieving user account',
+              error: process.env.NODE_ENV === 'development' ? retryError.message : undefined
+            });
+          }
+        } else {
+          return res.status(500).json({
+            success: false,
+            message: 'Error creating user account',
+            error: process.env.NODE_ENV === 'development' ? insertError.message : undefined
+          });
+        }
+      }
+    }
+
+    // Ensure user has required fields
+    if (!user || !user.id || !user.email) {
+      console.error('Invalid user data:', user);
+      return res.status(500).json({
+        success: false,
+        message: 'Invalid user data'
+      });
+    }
+
+    // Generate backend JWT token (using 'id' to match authenticateUser middleware)
+    if (!JWT_SECRET) {
+      console.error('JWT_SECRET is not set');
+      return res.status(500).json({
+        success: false,
+        message: 'Server configuration error'
+      });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRES_IN }
+    );
+
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: user.id,
+        first_name: user.first_name || '',
+        last_name: user.last_name || '',
+        email: user.email,
+        phone: user.phone || null
+      }
+    });
+
+  } catch (error) {
+    console.error('Error exchanging Supabase token:', error);
+    console.error('Error stack:', error.stack);
+    res.status(500).json({
+      success: false,
+      message: 'Error exchanging token',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
