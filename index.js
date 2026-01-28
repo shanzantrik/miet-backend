@@ -862,6 +862,18 @@ function generateWebinarId() {
   // ... existing code ...
 })();
 
+// Helper function to decode JWT without verification (for Supabase tokens)
+function decodeJwtPayload(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = Buffer.from(parts[1], 'base64').toString('utf8');
+    return JSON.parse(payload);
+  } catch (e) {
+    return null;
+  }
+}
+
 // --- Enhanced Auth Middleware ---
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -876,16 +888,67 @@ function authenticateToken(req, res, next) {
     });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({
-        success: false,
-        error: 'Invalid token',
-        message: 'Invalid or expired authentication token. Please log in again.'
-      });
+  // First try to verify as backend JWT
+  jwt.verify(token, JWT_SECRET, async (err, user) => {
+    if (!err && user) {
+      req.user = user;
+      return next();
     }
-    req.user = user;
-    next();
+
+    // If backend JWT verification fails, try to decode as Supabase token
+    const decoded = decodeJwtPayload(token);
+    if (decoded && decoded.email) {
+      // Check if token is expired
+      if (decoded.exp && decoded.exp * 1000 < Date.now()) {
+        return res.status(403).json({
+          success: false,
+          error: 'Token expired',
+          message: 'Your session has expired. Please log in again.'
+        });
+      }
+
+      // Find or create user by email
+      try {
+        let dbUser = await db.get('SELECT * FROM users_auth WHERE email = ?', decoded.email);
+        
+        if (!dbUser) {
+          // Create user from Supabase data
+          const fullName = decoded.user_metadata?.full_name || decoded.user_metadata?.name || decoded.email.split('@')[0];
+          const nameParts = fullName.split(' ');
+          const firstName = nameParts[0] || '';
+          const lastName = nameParts.slice(1).join(' ') || '';
+
+          const result = await db.run(
+            'INSERT INTO users_auth (first_name, last_name, email, is_verified) VALUES (?, ?, ?, ?)',
+            [firstName, lastName, decoded.email, 1]
+          );
+          
+          dbUser = {
+            id: result.lastID,
+            email: decoded.email,
+            first_name: firstName,
+            last_name: lastName
+          };
+        }
+
+        req.user = { id: dbUser.id, email: dbUser.email };
+        return next();
+      } catch (dbError) {
+        console.error('Error handling Supabase token:', dbError);
+        return res.status(500).json({
+          success: false,
+          error: 'Database error',
+          message: 'Error processing authentication'
+        });
+      }
+    }
+
+    // Token is invalid
+    return res.status(403).json({
+      success: false,
+      error: 'Invalid token',
+      message: 'Invalid or expired authentication token. Please log in again.'
+    });
   });
 }
 
@@ -894,7 +957,7 @@ function authenticateUser(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
-  if (!token) {
+  if (!token || token === 'null' || token === 'undefined') {
     return res.status(401).json({
       success: false,
       message: 'Access token required'
@@ -902,32 +965,80 @@ function authenticateUser(req, res, next) {
   }
 
   jwt.verify(token, JWT_SECRET, async (err, decoded) => {
-    if (err) {
-      return res.status(403).json({
-        success: false,
-        message: 'Invalid or expired token'
-      });
+    if (!err && decoded) {
+      try {
+        // Get user from database using backend JWT
+        const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.id);
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: 'User not found'
+          });
+        }
+
+        req.user = user;
+        return next();
+      } catch (error) {
+        console.error('Error authenticating user:', error);
+        return res.status(500).json({
+          success: false,
+          message: 'Authentication error'
+        });
+      }
     }
 
-    try {
-      // Get user from database
-      const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.id);
-      if (!user) {
-        return res.status(404).json({
+    // If backend JWT verification fails, try to decode as Supabase token
+    const supabaseDecoded = decodeJwtPayload(token);
+    if (supabaseDecoded && supabaseDecoded.email) {
+      // Check if token is expired
+      if (supabaseDecoded.exp && supabaseDecoded.exp * 1000 < Date.now()) {
+        return res.status(403).json({
           success: false,
-          message: 'User not found'
+          message: 'Your session has expired. Please log in again.'
         });
       }
 
-      req.user = user;
-      next();
-    } catch (error) {
-      console.error('Error authenticating user:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Authentication error'
-      });
+      try {
+        // Find or create user by email
+        let user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE email = ?', supabaseDecoded.email);
+        
+        if (!user) {
+          // Create user from Supabase data
+          const fullName = supabaseDecoded.user_metadata?.full_name || supabaseDecoded.user_metadata?.name || supabaseDecoded.email.split('@')[0];
+          const nameParts = fullName.split(' ');
+          const firstName = nameParts[0] || '';
+          const lastName = nameParts.slice(1).join(' ') || '';
+
+          const result = await db.run(
+            'INSERT INTO users_auth (first_name, last_name, email, is_verified) VALUES (?, ?, ?, ?)',
+            [firstName, lastName, supabaseDecoded.email, 1]
+          );
+          
+          user = {
+            id: result.lastID,
+            first_name: firstName,
+            last_name: lastName,
+            email: supabaseDecoded.email,
+            phone: null
+          };
+        }
+
+        req.user = user;
+        return next();
+      } catch (dbError) {
+        console.error('Error handling Supabase token in authenticateUser:', dbError);
+        return res.status(500).json({
+          success: false,
+          message: 'Error processing authentication'
+        });
+      }
     }
+
+    // Token is invalid
+    return res.status(403).json({
+      success: false,
+      message: 'Invalid or expired token'
+    });
   });
 }
 
