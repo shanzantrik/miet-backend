@@ -15,7 +15,7 @@ import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import Razorpay from 'razorpay';
 
-// Load environment variables
+// Load environment variables new
 dotenv.config();
 
 
@@ -866,22 +866,22 @@ function generateWebinarId() {
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  
+
   // Check if token exists and is not null/undefined string
   if (!token || token === 'null' || token === 'undefined') {
-    return res.status(401).json({ 
+    return res.status(401).json({
       success: false,
       error: 'Authentication required',
-      message: 'No valid authentication token provided. Please log in to continue.' 
+      message: 'No valid authentication token provided. Please log in to continue.'
     });
   }
-  
+
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) {
-      return res.status(403).json({ 
+      return res.status(403).json({
         success: false,
         error: 'Invalid token',
-        message: 'Invalid or expired authentication token. Please log in again.' 
+        message: 'Invalid or expired authentication token. Please log in again.'
       });
     }
     req.user = user;
@@ -1178,13 +1178,13 @@ app.post('/api/auth/supabase-token', async (req, res) => {
 
         // Fetch the newly created user to get all fields
         user = await db.get('SELECT * FROM users_auth WHERE id = ?', result.lastID);
-        
+
         if (!user) {
           throw new Error('Failed to retrieve created user');
         }
       } catch (insertError) {
         console.error('Error creating user:', insertError);
-        
+
         // Handle unique constraint violation (user might have been created by another request)
         if (insertError.message && insertError.message.includes('UNIQUE constraint')) {
           // User was created between our check and insert, fetch it now
@@ -5539,11 +5539,11 @@ app.post('/api/products', productUpload.fields([
     // Insert into database
     const result = await db.run(
       `INSERT INTO products (
-        product_type, title, name, description, price, video_url, thumbnail, author, 
-        pdf_file, product_image, purchase_link, download_link, icon, status, featured, 
-        subtitle, instructor_name, instructor_title, instructor_bio, instructor_image, 
+        product_type, title, name, description, price, video_url, thumbnail, author,
+        pdf_file, product_image, purchase_link, download_link, icon, status, featured,
+        subtitle, instructor_name, instructor_title, instructor_bio, instructor_image,
         duration, total_lectures, language, level, rating, total_ratings, enrolled_students,
-        category, format, total_pages, preview_file, platform, version, app_size, 
+        category, format, total_pages, preview_file, platform, version, app_size,
         brand, model, warranty, specifications, stock_quantity, images
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
