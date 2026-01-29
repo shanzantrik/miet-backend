@@ -3173,6 +3173,10 @@ app.get('/api/auth/test-token', (req, res) => {
 // POST /api/appointments/payment-first - Create appointment with payment first
 app.post('/api/appointments/payment-first', authenticateToken, async (req, res) => {
   try {
+    console.log('=== Payment-first appointment request ===');
+    console.log('Request body:', JSON.stringify(req.body, null, 2));
+    console.log('User from token:', req.user);
+
     const {
       consultant_id,
       title,
@@ -3191,6 +3195,7 @@ app.post('/api/appointments/payment-first', authenticateToken, async (req, res) 
 
     // Validate required fields
     if (!consultant_id || !title || !start_time || !end_time || !duration_minutes || !user_name || !user_email || !price) {
+      console.log('Validation failed - missing fields:', { consultant_id, title, start_time, end_time, duration_minutes, user_name, user_email, price });
       return res.status(400).json({
         success: false,
         message: 'Missing required fields: consultant_id, title, start_time, end_time, duration_minutes, user_name, user_email, price are required'
@@ -3198,18 +3203,23 @@ app.post('/api/appointments/payment-first', authenticateToken, async (req, res) 
     }
 
     // Check if consultant exists
+    console.log('Looking up consultant:', consultant_id);
     const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', consultant_id);
     if (!consultant) {
+      console.log('Consultant not found:', consultant_id);
       return res.status(404).json({
         success: false,
         message: 'Consultant not found'
       });
     }
+    console.log('Consultant found:', consultant.name);
 
     // Generate appointment ID
     const appointmentId = generateAppointmentId();
+    console.log('Generated appointment ID:', appointmentId);
 
     // Create appointment in database with 'payment_pending' status
+    console.log('Creating appointment in database...');
     const result = await db.run(
       `INSERT INTO appointments (
         appointment_id, consultant_id, user_id, title, description,
@@ -3224,6 +3234,7 @@ app.post('/api/appointments/payment-first', authenticateToken, async (req, res) 
         'payment_pending', 'pending', user_name, user_email, user_phone
       ]
     );
+    console.log('Appointment created, DB ID:', result.lastID);
 
     const appointmentDbId = result.lastID;
 
@@ -3242,19 +3253,21 @@ app.post('/api/appointments/payment-first', authenticateToken, async (req, res) 
     };
 
     console.log('Creating Razorpay order with options:', orderOptions);
-    console.log('Razorpay instance key_id:', RAZORPAY_KEY_ID);
-    console.log('Razorpay instance key_secret:', RAZORPAY_KEY_SECRET ? 'SET' : 'NOT SET');
+    console.log('Razorpay key_id:', RAZORPAY_KEY_ID ? RAZORPAY_KEY_ID.substring(0, 10) + '...' : 'NOT SET');
+    console.log('Razorpay key_secret:', RAZORPAY_KEY_SECRET ? 'SET (length: ' + RAZORPAY_KEY_SECRET.length + ')' : 'NOT SET');
 
     const razorpayOrder = await razorpay.orders.create(orderOptions);
     console.log('Razorpay order created successfully:', razorpayOrder.id);
 
     // Store payment order details in database
+    console.log('Storing payment order in database...');
     await db.run(
       `INSERT INTO appointment_payments (
         appointment_id, razorpay_order_id, amount, currency, status, created_at
       ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
       [appointmentDbId, razorpayOrder.id, price, 'INR', 'pending']
     );
+    console.log('Payment order stored successfully');
 
     res.json({
       success: true,
@@ -3274,12 +3287,18 @@ app.post('/api/appointments/payment-first', authenticateToken, async (req, res) 
     });
 
   } catch (error) {
-    console.error('Error creating payment-first appointment:', error);
+    console.error('=== Error in payment-first appointment ===');
+    console.error('Error name:', error.name);
+    console.error('Error message:', error.message);
+    console.error('Error stack:', error.stack);
+    if (error.statusCode) console.error('Razorpay status code:', error.statusCode);
+    if (error.error) console.error('Razorpay error details:', error.error);
+    
     res.status(500).json({
       success: false,
-      message: 'Error creating appointment',
+      message: 'Error creating appointment: ' + error.message,
       error: error.message,
-      stack: error.stack
+      errorType: error.name
     });
   }
 });
