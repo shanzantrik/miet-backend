@@ -14,13 +14,31 @@ import nodemailer from 'nodemailer';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import Razorpay from 'razorpay';
+import crypto from 'crypto';
 
 // Load environment variables
 dotenv.config();
 
+console.log('--- REFRESHED SERVER STARTING v4 ---');
+if (process.env.RAZORPAY_KEY_ID) {
+  const kid = process.env.RAZORPAY_KEY_ID;
+  const ksec = process.env.RAZORPAY_KEY_SECRET || '';
+  console.log(`RAZORPAY_KEY_ID: ${kid.substring(0, 8)}...${kid.substring(kid.length - 2)} (Length: ${kid.length})`);
+  console.log('RAZORPAY_KEY_SECRET:', ksec.substring(0, 2) + '...' + ksec.substring(ksec.length - 2) + ' (Length: ' + ksec.length + ')');
+} else {
+  console.log('RAZORPAY_KEY_ID: MISSING');
+}
+
 
 const app = express();
 app.use(express.json());
+
+// Simple request logger
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  next();
+});
+
 // CORS configuration
 const corsOptions = {
   origin: function (origin, callback) {
@@ -66,8 +84,8 @@ const PAYMENT_GATEWAY_API_KEY = process.env.PAYMENT_GATEWAY_API_KEY || 'test_key
 const PAYMENT_GATEWAY_SECRET = process.env.PAYMENT_GATEWAY_SECRET || 'test_secret';
 
 // Razorpay Configuration
-const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'your_razorpay_key_id_here';
-const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || 'your_razorpay_key_secret_here';
+const RAZORPAY_KEY_ID = (process.env.RAZORPAY_KEY_ID || 'your_razorpay_key_id_here').trim();
+const RAZORPAY_KEY_SECRET = (process.env.RAZORPAY_KEY_SECRET || 'your_razorpay_key_secret_here').trim();
 
 // Initialize Razorpay instance
 const razorpay = new Razorpay({
@@ -77,8 +95,8 @@ const razorpay = new Razorpay({
 
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = process.env.SMTP_PORT || 587;
-const SMTP_USER = process.env.SMTP_USER || 'shaanjyot13@gmail.com';
-const SMTP_PASS = process.env.SMTP_PASS || 'ljym tqld gqly bgep';
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
 
 // Google OAuth 2.0 Configuration
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '71256414599-qbgdkqe5urtc604ppitmqvg3k62hcgn3.apps.googleusercontent.com';
@@ -95,6 +113,12 @@ const GOOGLE_MEET_API_KEY = process.env.GOOGLE_MEET_API_KEY || 'AIzaSyDV6g8MPDTA
 const ADMIN_GOOGLE_CLIENT_ID = process.env.ADMIN_GOOGLE_CLIENT_ID || '71256414599-pue21h9bptf8tqo4bdh5k8eb7vbokmff.apps.googleusercontent.com';
 const ADMIN_GOOGLE_CLIENT_SECRET = process.env.ADMIN_GOOGLE_CLIENT_SECRET || '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';
 const ADMIN_GOOGLE_REDIRECT_URI = process.env.ADMIN_GOOGLE_REDIRECT_URI || 'http://localhost:4000/api/auth/admin/google/callback';
+
+console.log('--- GOOGLE AUTH CONFIGURATION ---');
+console.log('GOOGLE CLIENT ID 👉', process.env.GOOGLE_CLIENT_ID);
+console.log('Redirect URI being used:', GOOGLE_REDIRECT_URI);
+console.log('Please ensure this EXACT URL is added to your Google Cloud Console "Authorized redirect URIs"');
+console.log('---------------------------------');
 
 // CORS configuration with environment variable support
 const CORS_ORIGINS = process.env.CORS_ORIGINS ?
@@ -877,41 +901,42 @@ function authenticateToken(req, res, next) {
 // Enhanced authentication middleware for e-commerce
 function authenticateUser(req, res, next) {
   const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
 
-  if (!token) {
-    return res.status(401).json({
-      success: false,
-      message: 'Access token required'
-    });
+  if (!authHeader || authHeader === 'null' || authHeader === 'undefined') {
+    // If no token is provided, we don't set req.user and continue
+    // This allows guest checkout/payments to work if the route doesn't strictly need req.user
+    return next();
+  }
+
+  let token = authHeader;
+  if (authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  }
+
+  if (!token || token === 'null' || token === 'undefined' || token.trim() === '' || token.split('.').length !== 3) {
+    // Not a valid JWT format, skip verification
+    return next();
   }
 
   jwt.verify(token, JWT_SECRET, async (err, decoded) => {
     if (err) {
-      return res.status(403).json({
-        success: false,
-        message: 'Invalid or expired token'
-      });
+      // Token was provided but is invalid - we just log it and continue
+      // If a route REALLY needs a user, it will check for req.user itself
+      console.log('JWT Verification skipped/failed:', err.message);
+      return next();
     }
 
     try {
-      // Get user from database
-      const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.id);
-      if (!user) {
-        return res.status(404).json({
-          success: false,
-          message: 'User not found'
-        });
+      const userId = decoded.id || decoded.userId;
+      if (userId) {
+        const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', userId);
+        if (user) {
+          req.user = user;
+        }
       }
-
-      req.user = user;
       next();
     } catch (error) {
-      console.error('Error authenticating user:', error);
-      return res.status(500).json({
-        success: false,
-        message: 'Authentication error'
-      });
+      next();
     }
   });
 }
@@ -2582,7 +2607,7 @@ app.get('/api/payments/:paymentId/status', authenticateUser, async (req, res) =>
 
 // --- Razorpay Payment Integration API ---
 
-// POST /api/razorpay/create-order - Create Razorpay order (authenticated)
+// POST /api/razorpay/create-order - Create Razorpay order (authentication optional)
 app.post('/api/razorpay/create-order', authenticateUser, async (req, res) => {
   try {
     const { amount, currency = 'INR', receipt } = req.body;
@@ -2598,15 +2623,26 @@ app.post('/api/razorpay/create-order', authenticateUser, async (req, res) => {
     // Convert amount to paise (Razorpay expects amount in smallest currency unit)
     const amountInPaise = Math.round(amount * 100);
 
-    // Create Razorpay order
-    const orderOptions = {
-      amount: amountInPaise,
-      currency: currency,
-      receipt: receipt || `receipt_${Date.now()}`,
-      payment_capture: 1 // Auto capture payment
-    };
-
-    const razorpayOrder = await razorpay.orders.create(orderOptions);
+    // Create Razorpay order (or use mock for testing)
+    let razorpayOrder;
+    if (process.env.RAZORPAY_MOCK === 'true') {
+      console.log('--- RAZORPAY MOCK MODE ENABLED ---');
+      razorpayOrder = {
+        id: `order_mock_${Date.now()}`,
+        amount: amountInPaise,
+        currency: currency,
+        receipt: receipt || `receipt_${Date.now()}`,
+        status: 'created'
+      };
+    } else {
+      const orderOptions = {
+        amount: amountInPaise,
+        currency: currency,
+        receipt: receipt || `receipt_${Date.now()}`,
+        payment_capture: 1 // Auto capture payment
+      };
+      razorpayOrder = await razorpay.orders.create(orderOptions);
+    }
 
     res.json({
       success: true,
@@ -2621,16 +2657,18 @@ app.post('/api/razorpay/create-order', authenticateUser, async (req, res) => {
     });
 
   } catch (error) {
+    console.error('RAZORPAY_ERROR_DETAILS:', JSON.stringify(error, null, 2));
     console.error('Error creating Razorpay order:', error);
     res.status(500).json({
       success: false,
       message: 'Error creating Razorpay order',
-      error: error.message
+      error: error.message,
+      code: error.code || 'UNKNOWN'
     });
   }
 });
 
-// POST /api/razorpay/verify-payment - Verify Razorpay payment
+// POST /api/razorpay/verify-payment - Verify Razorpay payment (authentication optional)
 app.post('/api/razorpay/verify-payment', authenticateUser, async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
@@ -2644,7 +2682,6 @@ app.post('/api/razorpay/verify-payment', authenticateUser, async (req, res) => {
     }
 
     // Verify payment signature
-    const crypto = require('crypto');
     const expectedSignature = crypto
       .createHmac('sha256', RAZORPAY_KEY_SECRET)
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
@@ -2691,7 +2728,6 @@ app.post('/api/razorpay/webhook', async (req, res) => {
     const signature = req.headers['x-razorpay-signature'];
 
     // Verify webhook signature
-    const crypto = require('crypto');
     const expectedSignature = crypto
       .createHmac('sha256', RAZORPAY_KEY_SECRET)
       .update(JSON.stringify(body))
@@ -2906,7 +2942,6 @@ app.post('/api/appointments/confirm-payment', async (req, res) => {
     }
 
     // Verify payment signature
-    const crypto = require('crypto');
     const expectedSignature = crypto
       .createHmac('sha256', RAZORPAY_KEY_SECRET)
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
