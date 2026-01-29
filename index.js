@@ -93,6 +93,7 @@ const razorpay = new Razorpay({
   key_secret: RAZORPAY_KEY_SECRET,
 });
 
+
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = process.env.SMTP_PORT || 587;
 const SMTP_USER = process.env.SMTP_USER;
@@ -2812,6 +2813,7 @@ app.get('/api/razorpay/key', (req, res) => {
 // POST /api/appointments/payment-first - Create appointment with payment first
 app.post('/api/appointments/payment-first', authenticateToken, async (req, res) => {
   try {
+
     const {
       consultant_id,
       title,
@@ -2819,106 +2821,129 @@ app.post('/api/appointments/payment-first', authenticateToken, async (req, res) 
       start_time,
       end_time,
       duration_minutes,
-      attendee_emails,
+      attendee_emails = [],
       notes,
       price,
       user_name,
       user_email,
-      user_phone,
-      payment_method = 'razorpay'
+      user_phone
     } = req.body;
 
-    // Validate required fields
-    if (!consultant_id || !title || !start_time || !end_time || !duration_minutes || !user_name || !user_email || !price) {
+    if (
+      !consultant_id ||
+      !title ||
+      !start_time ||
+      !end_time ||
+      !duration_minutes ||
+      !user_name ||
+      !user_email ||
+      !price
+    ) {
       return res.status(400).json({
         success: false,
-        message: 'Missing required fields: consultant_id, title, start_time, end_time, duration_minutes, user_name, user_email, price are required'
+        message: "Missing required fields"
       });
     }
 
-    // Check if consultant exists
-    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', consultant_id);
+    const cleanPrice = Number(price);
+
+    if (isNaN(cleanPrice) || cleanPrice <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid price"
+      });
+    }
+
+    const consultant = await db.get(
+      "SELECT * FROM consultants WHERE id = ?",
+      consultant_id
+    );
+
     if (!consultant) {
       return res.status(404).json({
         success: false,
-        message: 'Consultant not found'
+        message: "Consultant not found"
       });
     }
 
-    // Generate appointment ID
     const appointmentId = generateAppointmentId();
 
-    // Create appointment in database with 'payment_pending' status
-    const result = await db.run(
-      `INSERT INTO appointments (
-        appointment_id, consultant_id, user_id, title, description,
-        start_time, end_time, duration_minutes, meeting_type,
-        attendee_emails, notes, price, status, payment_status,
+    const insert = await db.run(`
+      INSERT INTO appointments (
+        appointment_id, consultant_id, title, description,
+        start_time, end_time, duration_minutes,
+        attendee_emails, notes, price,
+        status, payment_status,
         user_name, user_email, user_phone
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        appointmentId, consultant_id, null, title, description,
-        start_time, end_time, duration_minutes, 'consultation',
-        JSON.stringify(attendee_emails || []), notes, price,
-        'payment_pending', 'pending', user_name, user_email, user_phone
-      ]
-    );
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+      appointmentId,
+      consultant_id,
+      title,
+      description,
+      start_time,
+      end_time,
+      duration_minutes,
+      JSON.stringify(attendee_emails),
+      notes,
+      cleanPrice,
+      "payment_pending",
+      "pending",
+      user_name,
+      user_email,
+      user_phone
+    ]);
 
-    const appointmentDbId = result.lastID;
+    const amountInPaise = Math.round(cleanPrice * 100);
 
-    // Create Razorpay order for the appointment
-    const amountInPaise = Math.round(price * 100);
-    const orderOptions = {
-      amount: amountInPaise,
-      currency: 'INR',
-      receipt: `appointment_${appointmentId}`,
-      payment_capture: 1,
-      notes: {
-        appointment_id: appointmentId,
-        consultant_name: consultant.name,
-        appointment_title: title
-      }
-    };
+    let order;
+    if (process.env.RAZORPAY_MOCK === 'true') {
+      console.log('--- RAZORPAY MOCK MODE (Appointment) ---');
+      order = {
+        id: `order_mock_${Date.now()}`,
+        amount: amountInPaise,
+        currency: "INR",
+        receipt: appointmentId,
+        status: 'created'
+      };
+    } else {
+      order = await razorpay.orders.create({
+        amount: amountInPaise,
+        currency: "INR",
+        receipt: appointmentId,
+        payment_capture: 1
+      });
+    }
 
-    console.log('Creating Razorpay order with options:', orderOptions);
-    console.log('Razorpay instance key_id:', RAZORPAY_KEY_ID);
-    console.log('Razorpay instance key_secret:', RAZORPAY_KEY_SECRET ? 'SET' : 'NOT SET');
-
-    const razorpayOrder = await razorpay.orders.create(orderOptions);
-    console.log('Razorpay order created successfully:', razorpayOrder.id);
-
-    // Store payment order details in database
-    await db.run(
-      `INSERT INTO appointment_payments (
-        appointment_id, razorpay_order_id, amount, currency, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-      [appointmentDbId, razorpayOrder.id, price, 'INR', 'pending']
-    );
+    await db.run(`
+      INSERT INTO appointment_payments 
+      (appointment_id, razorpay_order_id, amount, currency, status) 
+      VALUES (?, ?, ?, ?, ?)
+    `, [
+      insert.lastID,
+      order.id,
+      cleanPrice,
+      "INR",
+      "pending"
+    ]);
 
     res.json({
       success: true,
-      message: 'Appointment created. Please complete payment to confirm booking.',
       appointment_id: appointmentId,
-      appointment_db_id: appointmentDbId,
-      payment_order: {
-        id: razorpayOrder.id,
-        amount: razorpayOrder.amount,
-        currency: razorpayOrder.currency,
-        receipt: razorpayOrder.receipt
-      },
+      razorpay_order: order,
       consultant: {
         name: consultant.name,
         email: consultant.email
       }
     });
 
-  } catch (error) {
-    console.error('Error creating payment-first appointment:', error);
+  } catch (err) {
+    console.error("PAYMENT ERROR 👉", err);
+
     res.status(500).json({
       success: false,
-      message: 'Error creating appointment',
-      error: error.message,
-      stack: error.stack
+      message: "Payment creation failed",
+      error: err.message
     });
   }
 });
