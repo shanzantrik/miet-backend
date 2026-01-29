@@ -14,13 +14,31 @@ import nodemailer from 'nodemailer';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import Razorpay from 'razorpay';
+import crypto from 'crypto';
 
 // Load environment variables new
 dotenv.config();
 
+console.log('--- REFRESHED SERVER STARTING v4 ---');
+if (process.env.RAZORPAY_KEY_ID) {
+  const kid = process.env.RAZORPAY_KEY_ID;
+  const ksec = process.env.RAZORPAY_KEY_SECRET || '';
+  console.log(`RAZORPAY_KEY_ID: ${kid.substring(0, 8)}...${kid.substring(kid.length - 2)} (Length: ${kid.length})`);
+  console.log('RAZORPAY_KEY_SECRET:', ksec.substring(0, 2) + '...' + ksec.substring(ksec.length - 2) + ' (Length: ' + ksec.length + ')');
+} else {
+  console.log('RAZORPAY_KEY_ID: MISSING');
+}
+
 
 const app = express();
 app.use(express.json());
+
+// Simple request logger
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+  next();
+});
+
 // CORS configuration
 const corsOptions = {
   origin: function (origin, callback) {
@@ -66,8 +84,8 @@ const PAYMENT_GATEWAY_API_KEY = process.env.PAYMENT_GATEWAY_API_KEY || 'test_key
 const PAYMENT_GATEWAY_SECRET = process.env.PAYMENT_GATEWAY_SECRET || 'test_secret';
 
 // Razorpay Configuration
-const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || 'your_razorpay_key_id_here';
-const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || 'your_razorpay_key_secret_here';
+const RAZORPAY_KEY_ID = (process.env.RAZORPAY_KEY_ID || 'your_razorpay_key_id_here').trim();
+const RAZORPAY_KEY_SECRET = (process.env.RAZORPAY_KEY_SECRET || 'your_razorpay_key_secret_here').trim();
 
 // Initialize Razorpay instance
 const razorpay = new Razorpay({
@@ -77,8 +95,8 @@ const razorpay = new Razorpay({
 
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = process.env.SMTP_PORT || 587;
-const SMTP_USER = process.env.SMTP_USER || 'shaanjyot13@gmail.com';
-const SMTP_PASS = process.env.SMTP_PASS || 'ljym tqld gqly bgep';
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
 
 // Google OAuth 2.0 Configuration
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '71256414599-qbgdkqe5urtc604ppitmqvg3k62hcgn3.apps.googleusercontent.com';
@@ -95,6 +113,12 @@ const GOOGLE_MEET_API_KEY = process.env.GOOGLE_MEET_API_KEY || 'AIzaSyDV6g8MPDTA
 const ADMIN_GOOGLE_CLIENT_ID = process.env.ADMIN_GOOGLE_CLIENT_ID || '71256414599-pue21h9bptf8tqo4bdh5k8eb7vbokmff.apps.googleusercontent.com';
 const ADMIN_GOOGLE_CLIENT_SECRET = process.env.ADMIN_GOOGLE_CLIENT_SECRET || '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';
 const ADMIN_GOOGLE_REDIRECT_URI = process.env.ADMIN_GOOGLE_REDIRECT_URI || 'http://localhost:4000/api/auth/admin/google/callback';
+
+console.log('--- GOOGLE AUTH CONFIGURATION ---');
+console.log('GOOGLE CLIENT ID 👉', process.env.GOOGLE_CLIENT_ID);
+console.log('Redirect URI being used:', GOOGLE_REDIRECT_URI);
+console.log('Please ensure this EXACT URL is added to your Google Cloud Console "Authorized redirect URIs"');
+console.log('---------------------------------');
 
 // CORS configuration with environment variable support
 const CORS_ORIGINS = process.env.CORS_ORIGINS ?
@@ -867,14 +891,14 @@ function decodeJwtPayload(token) {
   try {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
-    
+
     // JWT uses base64url encoding - convert to standard base64
     let base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
     // Add padding if needed
     while (base64.length % 4) {
       base64 += '=';
     }
-    
+
     const payload = Buffer.from(base64, 'base64').toString('utf8');
     return JSON.parse(payload);
   } catch (e) {
@@ -924,7 +948,7 @@ async function authenticateToken(req, res, next) {
 
       // Find or create user by email
       let dbUser = await db.get('SELECT * FROM users_auth WHERE email = ?', decoded.email);
-      
+
       if (!dbUser) {
         // Create user from Supabase data
         const fullName = decoded.user_metadata?.full_name || decoded.user_metadata?.name || decoded.email.split('@')[0];
@@ -937,7 +961,7 @@ async function authenticateToken(req, res, next) {
             'INSERT INTO users_auth (first_name, last_name, email, is_verified) VALUES (?, ?, ?, ?)',
             [firstName, lastName, decoded.email, 1]
           );
-          
+
           dbUser = {
             id: result.lastID,
             email: decoded.email,
@@ -984,107 +1008,114 @@ async function authenticateToken(req, res, next) {
 }
 
 // Enhanced authentication middleware for e-commerce
-async function authenticateUser(req, res, next) {
+function authenticateUser(req, res, next) {
+  const authHeader = req.headers['authorization'];
+
+  if (!authHeader || authHeader === 'null' || authHeader === 'undefined') {
+    // If no token is provided, we don't set req.user and continue
+    // This allows guest checkout/payments to work if the route doesn't strictly need req.user
+    return next();
+  }
+
+  let token = authHeader;
+  if (authHeader.startsWith('Bearer ')) {
+    token = authHeader.split(' ')[1];
+  }
+
+  if (!token || token === 'null' || token === 'undefined' || token.trim() === '' || token.split('.').length !== 3) {
+    // Not a valid JWT format, skip verification
+    return next();
+  }
+
+  // First try to verify as backend JWT
   try {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token || token === 'null' || token === 'undefined') {
-      return res.status(401).json({
-        success: false,
-        message: 'Access token required'
-      });
-    }
-
-    // First try to verify as backend JWT
-    try {
-      const decoded = jwt.verify(token, JWT_SECRET);
-      if (decoded && decoded.id) {
-        // Get user from database using backend JWT
-        const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.id);
-        if (!user) {
-          return res.status(404).json({
-            success: false,
-            message: 'User not found'
-          });
-        }
-
-        req.user = user;
-        return next();
-      }
-    } catch (jwtError) {
-      // JWT verification failed, continue to try Supabase token
-      console.log('Backend JWT verification failed in authenticateUser, trying Supabase token');
-    }
-
-    // If backend JWT verification fails, try to decode as Supabase token
-    const supabaseDecoded = decodeJwtPayload(token);
-    if (supabaseDecoded && supabaseDecoded.email) {
-      // Check if token is expired
-      if (supabaseDecoded.exp && supabaseDecoded.exp * 1000 < Date.now()) {
-        return res.status(403).json({
-          success: false,
-          message: 'Your session has expired. Please log in again.'
-        });
-      }
-
-      // Find or create user by email
-      let user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE email = ?', supabaseDecoded.email);
-      
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded && decoded.id) {
+      // Get user from database using backend JWT
+      const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.id);
       if (!user) {
-        // Create user from Supabase data
-        const fullName = supabaseDecoded.user_metadata?.full_name || supabaseDecoded.user_metadata?.name || supabaseDecoded.email.split('@')[0];
-        const nameParts = fullName.split(' ');
-        const firstName = nameParts[0] || '';
-        const lastName = nameParts.slice(1).join(' ') || '';
-
-        try {
-          const result = await db.run(
-            'INSERT INTO users_auth (first_name, last_name, email, is_verified) VALUES (?, ?, ?, ?)',
-            [firstName, lastName, supabaseDecoded.email, 1]
-          );
-          
-          user = {
-            id: result.lastID,
-            first_name: firstName,
-            last_name: lastName,
-            email: supabaseDecoded.email,
-            phone: null
-          };
-        } catch (insertError) {
-          // Handle duplicate email (race condition)
-          if (insertError.message && insertError.message.includes('UNIQUE constraint')) {
-            user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE email = ?', supabaseDecoded.email);
-          } else {
-            throw insertError;
-          }
-        }
-      }
-
-      if (!user || !user.id) {
-        console.error('Failed to get/create user for email:', supabaseDecoded.email);
-        return res.status(500).json({
+        return res.status(404).json({
           success: false,
-          message: 'Failed to process user account'
+          message: 'User not found'
         });
       }
 
       req.user = user;
       return next();
     }
-
-    // Token is invalid
-    return res.status(403).json({
-      success: false,
-      message: 'Invalid or expired token'
-    });
-  } catch (error) {
-    console.error('Error in authenticateUser middleware:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Authentication error'
-    });
+  } catch (jwtError) {
+    // JWT verification failed, continue to try Supabase token
+    console.log('Backend JWT verification failed in authenticateUser, trying Supabase token');
   }
+
+  // If backend JWT verification fails, try to decode as Supabase token
+  const supabaseDecoded = decodeJwtPayload(token);
+  if (supabaseDecoded && supabaseDecoded.email) {
+    // Check if token is expired
+    if (supabaseDecoded.exp && supabaseDecoded.exp * 1000 < Date.now()) {
+      return res.status(403).json({
+        success: false,
+        message: 'Your session has expired. Please log in again.'
+      });
+    }
+
+    // Find or create user by email
+    let user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE email = ?', supabaseDecoded.email);
+
+    if (!user) {
+      // Create user from Supabase data
+      const fullName = supabaseDecoded.user_metadata?.full_name || supabaseDecoded.user_metadata?.name || supabaseDecoded.email.split('@')[0];
+      const nameParts = fullName.split(' ');
+      const firstName = nameParts[0] || '';
+      const lastName = nameParts.slice(1).join(' ') || '';
+
+      try {
+        const result = await db.run(
+          'INSERT INTO users_auth (first_name, last_name, email, is_verified) VALUES (?, ?, ?, ?)',
+          [firstName, lastName, supabaseDecoded.email, 1]
+        );
+
+        user = {
+          id: result.lastID,
+          first_name: firstName,
+          last_name: lastName,
+          email: supabaseDecoded.email,
+          phone: null
+        };
+      } catch (insertError) {
+        // Handle duplicate email (race condition)
+        if (insertError.message && insertError.message.includes('UNIQUE constraint')) {
+          user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE email = ?', supabaseDecoded.email);
+        } else {
+          throw insertError;
+        }
+      }
+    }
+
+    if (!user || !user.id) {
+      console.error('Failed to get/create user for email:', supabaseDecoded.email);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to process user account'
+      });
+    }
+
+    req.user = user;
+    return next();
+  }
+
+  // Token is invalid
+  return res.status(403).json({
+    success: false,
+    message: 'Invalid or expired token'
+  });
+} catch (error) {
+  console.error('Error in authenticateUser middleware:', error);
+  return res.status(500).json({
+    success: false,
+    message: 'Authentication error'
+  });
+}
 }
 
 // Simple rate limiting middleware
@@ -2902,7 +2933,7 @@ app.get('/api/payments/:paymentId/status', authenticateUser, async (req, res) =>
 
 // --- Razorpay Payment Integration API ---
 
-// POST /api/razorpay/create-order - Create Razorpay order (authenticated)
+// POST /api/razorpay/create-order - Create Razorpay order (authentication optional)
 app.post('/api/razorpay/create-order', authenticateUser, async (req, res) => {
   try {
     const { amount, currency = 'INR', receipt } = req.body;
@@ -2918,15 +2949,26 @@ app.post('/api/razorpay/create-order', authenticateUser, async (req, res) => {
     // Convert amount to paise (Razorpay expects amount in smallest currency unit)
     const amountInPaise = Math.round(amount * 100);
 
-    // Create Razorpay order
-    const orderOptions = {
-      amount: amountInPaise,
-      currency: currency,
-      receipt: receipt || `receipt_${Date.now()}`,
-      payment_capture: 1 // Auto capture payment
-    };
-
-    const razorpayOrder = await razorpay.orders.create(orderOptions);
+    // Create Razorpay order (or use mock for testing)
+    let razorpayOrder;
+    if (process.env.RAZORPAY_MOCK === 'true') {
+      console.log('--- RAZORPAY MOCK MODE ENABLED ---');
+      razorpayOrder = {
+        id: `order_mock_${Date.now()}`,
+        amount: amountInPaise,
+        currency: currency,
+        receipt: receipt || `receipt_${Date.now()}`,
+        status: 'created'
+      };
+    } else {
+      const orderOptions = {
+        amount: amountInPaise,
+        currency: currency,
+        receipt: receipt || `receipt_${Date.now()}`,
+        payment_capture: 1 // Auto capture payment
+      };
+      razorpayOrder = await razorpay.orders.create(orderOptions);
+    }
 
     res.json({
       success: true,
@@ -2941,16 +2983,18 @@ app.post('/api/razorpay/create-order', authenticateUser, async (req, res) => {
     });
 
   } catch (error) {
+    console.error('RAZORPAY_ERROR_DETAILS:', JSON.stringify(error, null, 2));
     console.error('Error creating Razorpay order:', error);
     res.status(500).json({
       success: false,
       message: 'Error creating Razorpay order',
-      error: error.message
+      error: error.message,
+      code: error.code || 'UNKNOWN'
     });
   }
 });
 
-// POST /api/razorpay/verify-payment - Verify Razorpay payment
+// POST /api/razorpay/verify-payment - Verify Razorpay payment (authentication optional)
 app.post('/api/razorpay/verify-payment', authenticateUser, async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
@@ -2964,7 +3008,6 @@ app.post('/api/razorpay/verify-payment', authenticateUser, async (req, res) => {
     }
 
     // Verify payment signature
-    const crypto = require('crypto');
     const expectedSignature = crypto
       .createHmac('sha256', RAZORPAY_KEY_SECRET)
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
@@ -3011,7 +3054,6 @@ app.post('/api/razorpay/webhook', async (req, res) => {
     const signature = req.headers['x-razorpay-signature'];
 
     // Verify webhook signature
-    const crypto = require('crypto');
     const expectedSignature = crypto
       .createHmac('sha256', RAZORPAY_KEY_SECRET)
       .update(JSON.stringify(body))
@@ -3098,11 +3140,11 @@ app.get('/api/auth/test-token', (req, res) => {
   try {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    
+
     if (!token) {
       return res.json({ success: false, message: 'No token provided' });
     }
-    
+
     // Try backend JWT
     let backendUser = null;
     try {
@@ -3110,10 +3152,10 @@ app.get('/api/auth/test-token', (req, res) => {
     } catch (e) {
       // Ignore - will try Supabase
     }
-    
+
     // Try Supabase JWT decode
     const supabaseDecoded = decodeJwtPayload(token);
-    
+
     res.json({
       success: true,
       backend_jwt_valid: !!backendUser,
@@ -3263,7 +3305,6 @@ app.post('/api/appointments/confirm-payment', async (req, res) => {
     }
 
     // Verify payment signature
-    const crypto = require('crypto');
     const expectedSignature = crypto
       .createHmac('sha256', RAZORPAY_KEY_SECRET)
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
