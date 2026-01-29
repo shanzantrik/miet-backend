@@ -1008,114 +1008,112 @@ async function authenticateToken(req, res, next) {
 }
 
 // Enhanced authentication middleware for e-commerce
-function authenticateUser(req, res, next) {
-  const authHeader = req.headers['authorization'];
-
-  if (!authHeader || authHeader === 'null' || authHeader === 'undefined') {
-    // If no token is provided, we don't set req.user and continue
-    // This allows guest checkout/payments to work if the route doesn't strictly need req.user
-    return next();
-  }
-
-  let token = authHeader;
-  if (authHeader.startsWith('Bearer ')) {
-    token = authHeader.split(' ')[1];
-  }
-
-  if (!token || token === 'null' || token === 'undefined' || token.trim() === '' || token.split('.').length !== 3) {
-    // Not a valid JWT format, skip verification
-    return next();
-  }
-
-  // First try to verify as backend JWT
+async function authenticateUser(req, res, next) {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded && decoded.id) {
-      // Get user from database using backend JWT
-      const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.id);
-      if (!user) {
-        return res.status(404).json({
+    const authHeader = req.headers['authorization'];
+
+    if (!authHeader || authHeader === 'null' || authHeader === 'undefined') {
+      // If no token is provided, we don't set req.user and continue
+      // This allows guest checkout/payments to work if the route doesn't strictly need req.user
+      return next();
+    }
+
+    let token = authHeader;
+    if (authHeader.startsWith('Bearer ')) {
+      token = authHeader.split(' ')[1];
+    }
+
+    if (!token || token === 'null' || token === 'undefined' || token.trim() === '' || token.split('.').length !== 3) {
+      // Not a valid JWT format, skip verification
+      return next();
+    }
+
+    // First try to verify as backend JWT
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (decoded && decoded.id) {
+        // Get user from database using backend JWT
+        const user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE id = ?', decoded.id);
+        if (!user) {
+          return res.status(404).json({
+            success: false,
+            message: 'User not found'
+          });
+        }
+
+        req.user = user;
+        return next();
+      }
+    } catch (jwtError) {
+      // JWT verification failed, continue to try Supabase token
+      console.log('Backend JWT verification failed in authenticateUser, trying Supabase token');
+    }
+
+    // If backend JWT verification fails, try to decode as Supabase token
+    const supabaseDecoded = decodeJwtPayload(token);
+    if (supabaseDecoded && supabaseDecoded.email) {
+      // Check if token is expired
+      if (supabaseDecoded.exp && supabaseDecoded.exp * 1000 < Date.now()) {
+        return res.status(403).json({
           success: false,
-          message: 'User not found'
+          message: 'Your session has expired. Please log in again.'
+        });
+      }
+
+      // Find or create user by email
+      let user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE email = ?', supabaseDecoded.email);
+
+      if (!user) {
+        // Create user from Supabase data
+        const fullName = supabaseDecoded.user_metadata?.full_name || supabaseDecoded.user_metadata?.name || supabaseDecoded.email.split('@')[0];
+        const nameParts = fullName.split(' ');
+        const firstName = nameParts[0] || '';
+        const lastName = nameParts.slice(1).join(' ') || '';
+
+        try {
+          const result = await db.run(
+            'INSERT INTO users_auth (first_name, last_name, email, is_verified) VALUES (?, ?, ?, ?)',
+            [firstName, lastName, supabaseDecoded.email, 1]
+          );
+
+          user = {
+            id: result.lastID,
+            first_name: firstName,
+            last_name: lastName,
+            email: supabaseDecoded.email,
+            phone: null
+          };
+        } catch (insertError) {
+          // Handle duplicate email (race condition)
+          if (insertError.message && insertError.message.includes('UNIQUE constraint')) {
+            user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE email = ?', supabaseDecoded.email);
+          } else {
+            throw insertError;
+          }
+        }
+      }
+
+      if (!user || !user.id) {
+        console.error('Failed to get/create user for email:', supabaseDecoded.email);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to process user account'
         });
       }
 
       req.user = user;
       return next();
     }
-  } catch (jwtError) {
-    // JWT verification failed, continue to try Supabase token
-    console.log('Backend JWT verification failed in authenticateUser, trying Supabase token');
-  }
 
-  // If backend JWT verification fails, try to decode as Supabase token
-  const supabaseDecoded = decodeJwtPayload(token);
-  if (supabaseDecoded && supabaseDecoded.email) {
-    // Check if token is expired
-    if (supabaseDecoded.exp && supabaseDecoded.exp * 1000 < Date.now()) {
-      return res.status(403).json({
-        success: false,
-        message: 'Your session has expired. Please log in again.'
-      });
-    }
-
-    // Find or create user by email
-    let user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE email = ?', supabaseDecoded.email);
-
-    if (!user) {
-      // Create user from Supabase data
-      const fullName = supabaseDecoded.user_metadata?.full_name || supabaseDecoded.user_metadata?.name || supabaseDecoded.email.split('@')[0];
-      const nameParts = fullName.split(' ');
-      const firstName = nameParts[0] || '';
-      const lastName = nameParts.slice(1).join(' ') || '';
-
-      try {
-        const result = await db.run(
-          'INSERT INTO users_auth (first_name, last_name, email, is_verified) VALUES (?, ?, ?, ?)',
-          [firstName, lastName, supabaseDecoded.email, 1]
-        );
-
-        user = {
-          id: result.lastID,
-          first_name: firstName,
-          last_name: lastName,
-          email: supabaseDecoded.email,
-          phone: null
-        };
-      } catch (insertError) {
-        // Handle duplicate email (race condition)
-        if (insertError.message && insertError.message.includes('UNIQUE constraint')) {
-          user = await db.get('SELECT id, first_name, last_name, email, phone FROM users_auth WHERE email = ?', supabaseDecoded.email);
-        } else {
-          throw insertError;
-        }
-      }
-    }
-
-    if (!user || !user.id) {
-      console.error('Failed to get/create user for email:', supabaseDecoded.email);
-      return res.status(500).json({
-        success: false,
-        message: 'Failed to process user account'
-      });
-    }
-
-    req.user = user;
+    // Token is invalid but we allow it to proceed without user (for optional auth)
     return next();
+  } catch (error) {
+    console.error('Error in authenticateUser middleware:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Authentication error'
+    });
   }
-
-  // Token is invalid
-  return res.status(403).json({
-    success: false,
-    message: 'Invalid or expired token'
-  });
-} catch (error) {
-  console.error('Error in authenticateUser middleware:', error);
-  return res.status(500).json({
-    success: false,
-    message: 'Authentication error'
-  });
-}
 }
 
 // Simple rate limiting middleware
