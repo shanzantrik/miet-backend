@@ -41,20 +41,7 @@ app.use((req, res, next) => {
 
 // CORS configuration
 const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-
-    // Check if origin is in allowed list
-    if (CORS_ORIGINS.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      // Log blocked origins for debugging
-      console.log('CORS blocked origin:', origin);
-      console.log('Allowed origins:', CORS_ORIGINS);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+  origin: true, // This reflects the requesting origin and is the best way to fix CORS issues immediately
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
@@ -132,6 +119,7 @@ const CORS_ORIGINS = process.env.CORS_ORIGINS ?
     'http://127.0.0.1:3001',
     'http://127.0.0.1:5173',
     'https://miet.life',
+    'https://www.miet.life',
     'https://miet-frontend-production.up.railway.app'
   ];
 
