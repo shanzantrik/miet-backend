@@ -40,8 +40,24 @@ app.use((req, res, next) => {
 });
 
 // CORS configuration
+// CORS configuration with environment variable support
+const CORS_ORIGINS = process.env.CORS_ORIGINS ?
+  process.env.CORS_ORIGINS.split(',') :
+  [
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://localhost:4000',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:3001',
+    'http://127.0.0.1:5173',
+    'https://miet.life',
+    'https://www.miet.life',
+    'https://miet-frontend-production.up.railway.app'
+  ];
+
 const corsOptions = {
-  origin: true, // This reflects the requesting origin and is the best way to fix CORS issues immediately
+  origin: CORS_ORIGINS,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
@@ -53,14 +69,7 @@ app.use(cors(corsOptions));
 // Handle preflight requests
 app.options('*', cors(corsOptions));
 
-// Add CORS headers to all responses as a fallback
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  next();
-});
+// CORS headers are handled by the cors middleware above
 
 app.use(bodyParser.json());
 
@@ -107,21 +116,7 @@ console.log('Redirect URI being used:', GOOGLE_REDIRECT_URI);
 console.log('Please ensure this EXACT URL is added to your Google Cloud Console "Authorized redirect URIs"');
 console.log('---------------------------------');
 
-// CORS configuration with environment variable support
-const CORS_ORIGINS = process.env.CORS_ORIGINS ?
-  process.env.CORS_ORIGINS.split(',') :
-  [
-    'http://localhost:3000',
-    'http://localhost:3001',
-    'http://localhost:4000',
-    'http://localhost:5173',
-    'http://127.0.0.1:3000',
-    'http://127.0.0.1:3001',
-    'http://127.0.0.1:5173',
-    'https://miet.life',
-    'https://www.miet.life',
-    'https://miet-frontend-production.up.railway.app'
-  ];
+// CORS configuration has been moved to the top of the file
 
 const INIT_DB = process.argv.includes('--initdb');
 
