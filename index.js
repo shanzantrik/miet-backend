@@ -71,8 +71,8 @@ const PAYMENT_GATEWAY_API_KEY = process.env.PAYMENT_GATEWAY_API_KEY || 'test_key
 const PAYMENT_GATEWAY_SECRET = process.env.PAYMENT_GATEWAY_SECRET || 'test_secret';
 
 // Razorpay Configuration
-const RAZORPAY_KEY_ID = (process.env.RAZORPAY_KEY_ID || 'your_razorpay_key_id_here').trim();
-const RAZORPAY_KEY_SECRET = (process.env.RAZORPAY_KEY_SECRET || 'your_razorpay_key_secret_here').trim();
+const RAZORPAY_KEY_ID = (process.env.RAZORPAY_KEY_ID || 'rzp_test_RQjuEuLdbucrfe').trim();
+const RAZORPAY_KEY_SECRET = (process.env.RAZORPAY_KEY_SECRET || 'tARKvQr6ViMb7OYx62pC93I7').trim();
 
 // Initialize Razorpay instance
 const razorpay = new Razorpay({
