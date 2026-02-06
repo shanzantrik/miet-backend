@@ -126,10 +126,12 @@ const CORS_ORIGINS = process.env.CORS_ORIGINS ?
   [
     'http://localhost:3000',
     'http://localhost:3001',
+    'http://localhost:4000',
     'http://localhost:5173',
     'http://127.0.0.1:3000',
     'http://127.0.0.1:3001',
     'http://127.0.0.1:5173',
+    'https://miet.life',
     'https://miet-frontend-production.up.railway.app'
   ];
 
@@ -3238,26 +3240,39 @@ app.post('/api/appointments/payment-first', authenticateToken, async (req, res) 
 
     const appointmentDbId = result.lastID;
 
-    // Create Razorpay order for the appointment
+    // Create Razorpay order for the appointment (or use mock for testing)
     const amountInPaise = Math.round(price * 100);
-    const orderOptions = {
-      amount: amountInPaise,
-      currency: 'INR',
-      receipt: `appointment_${appointmentId}`,
-      payment_capture: 1,
-      notes: {
-        appointment_id: appointmentId,
-        consultant_name: consultant.name,
-        appointment_title: title
-      }
-    };
+    let razorpayOrder;
 
-    console.log('Creating Razorpay order with options:', orderOptions);
-    console.log('Razorpay key_id:', RAZORPAY_KEY_ID ? RAZORPAY_KEY_ID.substring(0, 10) + '...' : 'NOT SET');
-    console.log('Razorpay key_secret:', RAZORPAY_KEY_SECRET ? 'SET (length: ' + RAZORPAY_KEY_SECRET.length + ')' : 'NOT SET');
+    if (process.env.RAZORPAY_MOCK === 'true') {
+      console.log('--- RAZORPAY MOCK MODE ENABLED (APPOINTMENT) ---');
+      razorpayOrder = {
+        id: `order_mock_${Date.now()}`,
+        amount: amountInPaise,
+        currency: 'INR',
+        receipt: `appointment_${appointmentId}`,
+        status: 'created'
+      };
+    } else {
+      const orderOptions = {
+        amount: amountInPaise,
+        currency: 'INR',
+        receipt: `appointment_${appointmentId}`,
+        payment_capture: 1,
+        notes: {
+          appointment_id: appointmentId,
+          consultant_name: consultant.name,
+          appointment_title: title
+        }
+      };
 
-    const razorpayOrder = await razorpay.orders.create(orderOptions);
-    console.log('Razorpay order created successfully:', razorpayOrder.id);
+      console.log('Creating Razorpay order with options:', orderOptions);
+      console.log('Razorpay key_id:', RAZORPAY_KEY_ID ? RAZORPAY_KEY_ID.substring(0, 10) + '...' : 'NOT SET');
+      console.log('Razorpay key_secret:', RAZORPAY_KEY_SECRET ? 'SET (length: ' + RAZORPAY_KEY_SECRET.length + ')' : 'NOT SET');
+
+      razorpayOrder = await razorpay.orders.create(orderOptions);
+      console.log('Razorpay order created successfully:', razorpayOrder.id);
+    }
 
     // Store payment order details in database
     console.log('Storing payment order in database...');
@@ -3293,7 +3308,7 @@ app.post('/api/appointments/payment-first', authenticateToken, async (req, res) 
     console.error('Error stack:', error.stack);
     if (error.statusCode) console.error('Razorpay status code:', error.statusCode);
     if (error.error) console.error('Razorpay error details:', error.error);
-    
+
     res.status(500).json({
       success: false,
       message: 'Error creating appointment: ' + error.message,
