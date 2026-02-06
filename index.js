@@ -118,7 +118,10 @@ const SMTP_PASS = process.env.SMTP_PASS;
 // Google OAuth 2.0 Configuration
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '71256414599-qbgdkqe5urtc604ppitmqvg3k62hcgn3.apps.googleusercontent.com';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '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';
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:4000/api/auth/google/callback';
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI ||
+  (process.env.NODE_ENV === 'production'
+    ? 'https://miet-backend-production.up.railway.app/api/auth/google/callback'
+    : 'http://localhost:4000/api/auth/google/callback');
 
 // Google Calendar API
 const GOOGLE_CALENDAR_API_KEY = process.env.GOOGLE_CALENDAR_API_KEY || 'AIzaSyAmpa3H1449VHQeOA7cJ1h1fp5WUu5d4pM';
@@ -129,7 +132,10 @@ const GOOGLE_MEET_API_KEY = process.env.GOOGLE_MEET_API_KEY || 'AIzaSyDV6g8MPDTA
 // Admin Google OAuth (for admin scheduling) - Use same credentials as regular OAuth for now
 const ADMIN_GOOGLE_CLIENT_ID = process.env.ADMIN_GOOGLE_CLIENT_ID || '71256414599-pue21h9bptf8tqo4bdh5k8eb7vbokmff.apps.googleusercontent.com';
 const ADMIN_GOOGLE_CLIENT_SECRET = process.env.ADMIN_GOOGLE_CLIENT_SECRET || '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';
-const ADMIN_GOOGLE_REDIRECT_URI = process.env.ADMIN_GOOGLE_REDIRECT_URI || 'http://localhost:4000/api/auth/admin/google/callback';
+const ADMIN_GOOGLE_REDIRECT_URI = process.env.ADMIN_GOOGLE_REDIRECT_URI ||
+  (process.env.NODE_ENV === 'production'
+    ? 'https://miet-backend-production.up.railway.app/api/auth/admin/google/callback'
+    : 'http://localhost:4000/api/auth/admin/google/callback');
 
 console.log('--- GOOGLE AUTH CONFIGURATION ---');
 console.log('GOOGLE CLIENT ID 👉', process.env.GOOGLE_CLIENT_ID);
@@ -2056,13 +2062,12 @@ app.post('/api/consultants/:id/featured', authenticateToken, requireRole('supera
   res.json({ success: true });
 });
 // Consultant availability CRUD (consultant or superadmin)
-app.get('/api/consultants/:id/availability', authenticateToken, async (req, res) => {
+app.get('/api/consultants/:id/availability', async (req, res) => {
   const { id } = req.params;
   const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', id);
   if (!consultant) return res.status(404).json({ error: 'Not found' });
-  if (req.user.role !== 'superadmin' && req.user.id !== consultant.user_id) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+
+  // Public endpoint - allow anyone to check availability
   const slots = await db.all('SELECT * FROM consultant_availability WHERE consultant_id = ?', id);
   res.json(slots);
 });
