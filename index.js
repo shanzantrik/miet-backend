@@ -15,9 +15,30 @@ import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
 import Razorpay from 'razorpay';
 import crypto from 'crypto';
+import { createClient } from '@supabase/supabase-js';
 
 // Load environment variables new
 dotenv.config();
+
+// Supabase Configuration
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_KEY && SUPABASE_URL !== '' && SUPABASE_SERVICE_KEY !== '') {
+  try {
+    supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+    console.log('✅ Supabase client initialized for admin auth');
+    console.log('   Supabase URL:', SUPABASE_URL.substring(0, 30) + '...');
+  } catch (error) {
+    console.error('❌ Failed to initialize Supabase client:', error.message);
+    supabase = null;
+  }
+} else {
+  console.warn('⚠️ Supabase credentials not found. Admin auth will fall back to SQLite.');
+  console.warn('   SUPABASE_URL:', SUPABASE_URL ? 'Set' : 'Missing');
+  console.warn('   SUPABASE_SERVICE_KEY:', SUPABASE_SERVICE_KEY ? 'Set' : 'Missing');
+}
 
 console.log('--- REFRESHED SERVER STARTING v4 ---');
 if (process.env.RAZORPAY_KEY_ID) {
@@ -1137,14 +1158,95 @@ const checkoutLimiter = (req, res, next) => {
 // --- Auth API ---
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-  const user = await db.get('SELECT * FROM admin WHERE username = ?', username);
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-  const valid = await bcrypt.compare(password, user.password);
-  if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-  // Fetch corresponding user from users table for role/id
-  const userRow = await db.get('SELECT * FROM users WHERE username = ?', username);
-  const token = jwt.sign({ id: userRow?.id, username: user.username, role: userRow?.role || 'superadmin' }, JWT_SECRET, { expiresIn: '1d' });
-  res.json({ token });
+
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required' });
+  }
+
+  try {
+    // Try Supabase first if configured
+    if (supabase) {
+      try {
+        // Query admins table in Supabase
+        const { data: adminUser, error: supabaseError } = await supabase
+          .from('admins')
+          .select('*')
+          .eq('username', username)
+          .single();
+
+        // PGRST116 means no rows found - that's okay, fall back to SQLite
+        if (supabaseError && supabaseError.code !== 'PGRST116') {
+          // Log error but continue to SQLite fallback
+          console.error('Supabase admin query error:', supabaseError.message || supabaseError);
+        }
+
+        if (adminUser && !supabaseError) {
+          // Verify password
+          const valid = await bcrypt.compare(password, adminUser.password);
+          if (!valid) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+          }
+
+          // Generate JWT token
+          const token = jwt.sign(
+            {
+              id: adminUser.id,
+              username: adminUser.username,
+              role: adminUser.role || 'superadmin',
+              email: adminUser.email
+            },
+            JWT_SECRET,
+            { expiresIn: '1d' }
+          );
+
+          return res.json({
+            token,
+            user: {
+              id: adminUser.id,
+              username: adminUser.username,
+              role: adminUser.role || 'superadmin',
+              email: adminUser.email
+            }
+          });
+        }
+      } catch (supabaseErr) {
+        // Supabase query failed, log and fall back to SQLite
+        console.warn('Supabase query failed, falling back to SQLite:', supabaseErr.message || supabaseErr);
+      }
+    }
+
+    // Fallback to SQLite if Supabase not configured or admin not found
+    if (!db) {
+      console.error('Database not initialized');
+      return res.status(500).json({ error: 'Database not available' });
+    }
+
+    const user = await db.get('SELECT * FROM admin WHERE username = ?', username);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Fetch corresponding user from users table for role/id
+    const userRow = await db.get('SELECT * FROM users WHERE username = ?', username);
+    const token = jwt.sign(
+      { id: userRow?.id, username: user.username, role: userRow?.role || 'superadmin' },
+      JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+
+    res.json({ token });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      error: 'Login failed. Please try again.',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
 });
 
 // --- E-commerce User Authentication API ---
