@@ -7292,5 +7292,15 @@ app.use((req, res, next) => {
 
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
+  // Multer file upload errors - return 400 with message
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(400).json({ error: 'File too large. Max size is 10MB per image.' });
+  }
+  if (err.code === 'LIMIT_FILE_COUNT' || err.code === 'LIMIT_UNEXPECTED_FILE') {
+    return res.status(400).json({ error: err.message || 'File upload limit exceeded.' });
+  }
+  if (err.message && (err.message.includes('image') || err.message.includes('Only image'))) {
+    return res.status(400).json({ error: err.message });
+  }
   res.status(500).json({ error: 'Internal server error' });
 });
