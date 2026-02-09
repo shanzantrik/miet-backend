@@ -2021,23 +2021,24 @@ app.put('/api/consultants/:id', authenticateToken, async (req, res) => {
   }
   // Only update allowed fields
   const fields = [
-    'name', 'email', 'phone', 'image', 'description', 'tagline', 'location_lat', 'location_lng', 'address', 'speciality', 'id_proof_type', 'id_proof_url', 'aadhar', 'bank_account', 'bank_ifsc', 'status', 'city', 'featured'
+    'name', 'email', 'phone', 'image', 'description', 'tagline', 'location_lat', 'location_lng', 'address', 'speciality', 'id_proof_type', 'id_proof_url', 'aadhar', 'bank_account', 'bank_ifsc', 'status', 'city', 'featured', 'consultation_price'
   ];
   const updates = [];
   const values = [];
   for (const field of fields) {
     if (req.body[field] !== undefined) {
       updates.push(`${field} = ?`);
-      // Handle featured field as boolean to integer conversion
       if (field === 'featured') {
         values.push(req.body[field] ? 1 : 0);
+      } else if (field === 'consultation_price') {
+        values.push(req.body[field] != null ? Number(req.body[field]) : null);
       } else {
         values.push(req.body[field]);
       }
     }
   }
   // Require city for update as well
-  if (!req.body.city || req.body.city.trim() === '') return res.status(400).json({ error: 'City is required' });
+  if (!req.body.city || String(req.body.city || '').trim() === '') return res.status(400).json({ error: 'City is required' });
   if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
   values.push(id);
   await db.run(`UPDATE consultants SET ${updates.join(', ')} WHERE id = ?`, ...values);
