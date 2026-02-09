@@ -6797,16 +6797,6 @@ app.get('/api/test-simple', (req, res) => {
   res.json({ message: 'Simple test endpoint works!' });
 });
 
-// --- Catch-all 404 and error handler for JSON responses ---
-app.use((req, res, next) => {
-  res.status(404).json({ error: 'Not found' });
-});
-
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
 // --- Consultant Dashboard API Endpoints ---
 
 // Get consultant profile
@@ -7294,4 +7284,13 @@ app.delete('/api/cms/:id', async (req, res) => {
 
 // --- End Gallery & CMS API Endpoints ---
 
+// --- Catch-all 404 and error handler for JSON responses ---
+// IMPORTANT: This must be the LAST middleware, after all route definitions
+app.use((req, res, next) => {
+  res.status(404).json({ error: 'Not found' });
+});
 
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
