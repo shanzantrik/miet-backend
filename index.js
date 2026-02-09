@@ -61,21 +61,24 @@ app.use((req, res, next) => {
 });
 
 // CORS configuration
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
+// CORS configuration with environment variable support
+const CORS_ORIGINS = process.env.CORS_ORIGINS ?
+  process.env.CORS_ORIGINS.split(',') :
+  [
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://localhost:4000',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:3001',
+    'http://127.0.0.1:5173',
+    'https://miet.life',
+    'https://www.miet.life',
+    'https://miet-frontend-production.up.railway.app'
+  ];
 
-    // Check if origin is in allowed list
-    if (CORS_ORIGINS.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      // Log blocked origins for debugging
-      console.log('CORS blocked origin:', origin);
-      console.log('Allowed origins:', CORS_ORIGINS);
-      callback(new Error('Not allowed by CORS'));
-    }
-  },
+const corsOptions = {
+  origin: CORS_ORIGINS,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
@@ -87,14 +90,7 @@ app.use(cors(corsOptions));
 // Handle preflight requests
 app.options('*', cors(corsOptions));
 
-// Add CORS headers to all responses as a fallback
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
-  res.header('Access-Control-Allow-Credentials', 'true');
-  next();
-});
+// CORS headers are handled by the cors middleware above
 
 app.use(bodyParser.json());
 
@@ -105,8 +101,8 @@ const PAYMENT_GATEWAY_API_KEY = process.env.PAYMENT_GATEWAY_API_KEY || 'test_key
 const PAYMENT_GATEWAY_SECRET = process.env.PAYMENT_GATEWAY_SECRET || 'test_secret';
 
 // Razorpay Configuration
-const RAZORPAY_KEY_ID = (process.env.RAZORPAY_KEY_ID || 'your_razorpay_key_id_here').trim();
-const RAZORPAY_KEY_SECRET = (process.env.RAZORPAY_KEY_SECRET || 'your_razorpay_key_secret_here').trim();
+const RAZORPAY_KEY_ID = (process.env.RAZORPAY_KEY_ID || 'rzp_test_RQjuEuLdbucrfe').trim();
+const RAZORPAY_KEY_SECRET = (process.env.RAZORPAY_KEY_SECRET || 'tARKvQr6ViMb7OYx62pC93I7').trim();
 
 // Initialize Razorpay instance
 const razorpay = new Razorpay({
@@ -122,7 +118,10 @@ const SMTP_PASS = process.env.SMTP_PASS;
 // Google OAuth 2.0 Configuration
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '71256414599-qbgdkqe5urtc604ppitmqvg3k62hcgn3.apps.googleusercontent.com';
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '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';
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:4000/api/auth/google/callback';
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI ||
+  (process.env.NODE_ENV === 'production'
+    ? 'https://miet-backend-production.up.railway.app/api/auth/google/callback'
+    : 'http://localhost:4000/api/auth/google/callback');
 
 // Google Calendar API
 const GOOGLE_CALENDAR_API_KEY = process.env.GOOGLE_CALENDAR_API_KEY || 'AIzaSyAmpa3H1449VHQeOA7cJ1h1fp5WUu5d4pM';
@@ -133,7 +132,10 @@ const GOOGLE_MEET_API_KEY = process.env.GOOGLE_MEET_API_KEY || 'AIzaSyDV6g8MPDTA
 // Admin Google OAuth (for admin scheduling) - Use same credentials as regular OAuth for now
 const ADMIN_GOOGLE_CLIENT_ID = process.env.ADMIN_GOOGLE_CLIENT_ID || '71256414599-pue21h9bptf8tqo4bdh5k8eb7vbokmff.apps.googleusercontent.com';
 const ADMIN_GOOGLE_CLIENT_SECRET = process.env.ADMIN_GOOGLE_CLIENT_SECRET || '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';
-const ADMIN_GOOGLE_REDIRECT_URI = process.env.ADMIN_GOOGLE_REDIRECT_URI || 'http://localhost:4000/api/auth/admin/google/callback';
+const ADMIN_GOOGLE_REDIRECT_URI = process.env.ADMIN_GOOGLE_REDIRECT_URI ||
+  (process.env.NODE_ENV === 'production'
+    ? 'https://miet-backend-production.up.railway.app/api/auth/admin/google/callback'
+    : 'http://localhost:4000/api/auth/admin/google/callback');
 
 console.log('--- GOOGLE AUTH CONFIGURATION ---');
 console.log('GOOGLE CLIENT ID 👉', process.env.GOOGLE_CLIENT_ID);
@@ -141,18 +143,7 @@ console.log('Redirect URI being used:', GOOGLE_REDIRECT_URI);
 console.log('Please ensure this EXACT URL is added to your Google Cloud Console "Authorized redirect URIs"');
 console.log('---------------------------------');
 
-// CORS configuration with environment variable support
-const CORS_ORIGINS = process.env.CORS_ORIGINS ?
-  process.env.CORS_ORIGINS.split(',') :
-  [
-    'http://localhost:3000',
-    'http://localhost:3001',
-    'http://localhost:5173',
-    'http://127.0.0.1:3000',
-    'http://127.0.0.1:3001',
-    'http://127.0.0.1:5173',
-    'https://miet-frontend-production.up.railway.app'
-  ];
+// CORS configuration has been moved to the top of the file
 
 const INIT_DB = process.argv.includes('--initdb');
 
@@ -2083,13 +2074,12 @@ app.post('/api/consultants/:id/featured', authenticateToken, requireRole('supera
   res.json({ success: true });
 });
 // Consultant availability CRUD (consultant or superadmin)
-app.get('/api/consultants/:id/availability', authenticateToken, async (req, res) => {
+app.get('/api/consultants/:id/availability', async (req, res) => {
   const { id } = req.params;
   const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', id);
   if (!consultant) return res.status(404).json({ error: 'Not found' });
-  if (req.user.role !== 'superadmin' && req.user.id !== consultant.user_id) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
+
+  // Public endpoint - allow anyone to check availability
   const slots = await db.all('SELECT * FROM consultant_availability WHERE consultant_id = ?', id);
   res.json(slots);
 });
@@ -3352,26 +3342,39 @@ app.post('/api/appointments/payment-first', authenticateToken, async (req, res) 
 
     const appointmentDbId = result.lastID;
 
-    // Create Razorpay order for the appointment
+    // Create Razorpay order for the appointment (or use mock for testing)
     const amountInPaise = Math.round(price * 100);
-    const orderOptions = {
-      amount: amountInPaise,
-      currency: 'INR',
-      receipt: `appointment_${appointmentId}`,
-      payment_capture: 1,
-      notes: {
-        appointment_id: appointmentId,
-        consultant_name: consultant.name,
-        appointment_title: title
-      }
-    };
+    let razorpayOrder;
 
-    console.log('Creating Razorpay order with options:', orderOptions);
-    console.log('Razorpay key_id:', RAZORPAY_KEY_ID ? RAZORPAY_KEY_ID.substring(0, 10) + '...' : 'NOT SET');
-    console.log('Razorpay key_secret:', RAZORPAY_KEY_SECRET ? 'SET (length: ' + RAZORPAY_KEY_SECRET.length + ')' : 'NOT SET');
+    if (process.env.RAZORPAY_MOCK === 'true') {
+      console.log('--- RAZORPAY MOCK MODE ENABLED (APPOINTMENT) ---');
+      razorpayOrder = {
+        id: `order_mock_${Date.now()}`,
+        amount: amountInPaise,
+        currency: 'INR',
+        receipt: `appointment_${appointmentId}`,
+        status: 'created'
+      };
+    } else {
+      const orderOptions = {
+        amount: amountInPaise,
+        currency: 'INR',
+        receipt: `appointment_${appointmentId}`,
+        payment_capture: 1,
+        notes: {
+          appointment_id: appointmentId,
+          consultant_name: consultant.name,
+          appointment_title: title
+        }
+      };
 
-    const razorpayOrder = await razorpay.orders.create(orderOptions);
-    console.log('Razorpay order created successfully:', razorpayOrder.id);
+      console.log('Creating Razorpay order with options:', orderOptions);
+      console.log('Razorpay key_id:', RAZORPAY_KEY_ID ? RAZORPAY_KEY_ID.substring(0, 10) + '...' : 'NOT SET');
+      console.log('Razorpay key_secret:', RAZORPAY_KEY_SECRET ? 'SET (length: ' + RAZORPAY_KEY_SECRET.length + ')' : 'NOT SET');
+
+      razorpayOrder = await razorpay.orders.create(orderOptions);
+      console.log('Razorpay order created successfully:', razorpayOrder.id);
+    }
 
     // Store payment order details in database
     console.log('Storing payment order in database...');
