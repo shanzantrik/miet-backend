@@ -565,6 +565,18 @@ async function setupDatabase() {
   }
 
   try {
+    await ensureGalleryTable();
+  } catch (error) {
+    console.error('Error ensuring gallery table:', error);
+  }
+
+  try {
+    await ensureCmsTable();
+  } catch (error) {
+    console.error('Error ensuring CMS table:', error);
+  }
+
+  try {
     await ensureEcommerceTables();
     console.log('E-commerce tables ensured successfully.');
   } catch (error) {
@@ -4788,9 +4800,10 @@ const productImagesDir = path.join(uploadsDir, 'product_images');
 const instructorsDir = path.join(uploadsDir, 'instructors');
 const coursesDir = path.join(uploadsDir, 'courses');
 const blogsDir = path.join(uploadsDir, 'blogs');
+const galleryDir = path.join(uploadsDir, 'gallery');
 
 // Create directories if they don't exist
-[uploadsDir, thumbnailsDir, pdfsDir, iconsDir, productImagesDir, instructorsDir, coursesDir, blogsDir].forEach(dir => {
+[uploadsDir, thumbnailsDir, pdfsDir, iconsDir, productImagesDir, instructorsDir, coursesDir, blogsDir, galleryDir].forEach(dir => {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -4822,6 +4835,7 @@ app.use('/uploads/product_images', express.static(productImagesDir));
 app.use('/uploads/instructors', express.static(instructorsDir));
 app.use('/uploads/courses', express.static(coursesDir));
 app.use('/uploads/blogs', express.static(blogsDir));
+app.use('/uploads/gallery', express.static(galleryDir));
 app.use('/uploads', express.static(uploadsDir));
 // File upload endpoint
 app.post('/api/upload', upload.single('file'), (req, res) => {
@@ -5309,6 +5323,51 @@ async function ensureBlogsTable() {
     console.log('Blogs table created successfully');
   } catch (error) {
     console.error('Error creating blogs table:', error);
+    throw error;
+  }
+}
+
+// Ensure gallery_images table exists
+async function ensureGalleryTable() {
+  try {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS gallery_images (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        description TEXT,
+        image_path TEXT NOT NULL,
+        display_order INTEGER DEFAULT 0,
+        status TEXT CHECK(status IN ('active', 'inactive')) NOT NULL DEFAULT 'active',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log('Gallery images table ensured successfully.');
+  } catch (error) {
+    console.error('Error creating gallery_images table:', error);
+    throw error;
+  }
+}
+
+// Ensure cms_content table exists
+async function ensureCmsTable() {
+  try {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS cms_content (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        page_key TEXT NOT NULL,
+        section_key TEXT NOT NULL,
+        field_key TEXT NOT NULL,
+        field_value TEXT,
+        field_type TEXT CHECK(field_type IN ('text', 'textarea', 'html', 'image', 'number', 'json')) NOT NULL DEFAULT 'text',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(page_key, section_key, field_key)
+      );
+    `);
+    console.log('CMS content table ensured successfully.');
+  } catch (error) {
+    console.error('Error creating cms_content table:', error);
     throw error;
   }
 }
@@ -6877,5 +6936,359 @@ app.delete('/api/consultants/availability/:id', authenticateToken, async (req, r
 });
 
 // --- End Consultant Dashboard API Endpoints ---
+
+// =============================================
+// --- Gallery Image CRUD API Endpoints ---
+// =============================================
+
+// Multer configuration for gallery images
+const galleryStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    const dir = path.join(process.cwd(), 'uploads', 'gallery');
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    cb(null, dir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    let safeName = file.originalname
+      .toLowerCase()
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^\x00-\x7F]/g, '')
+      .replace(/\s+/g, '_')
+      .replace(/['"`]/g, '')
+      .replace(/[^a-z0-9._-]/g, '_');
+    cb(null, uniqueSuffix + '-' + safeName);
+  }
+});
+
+const galleryUpload = multer({
+  storage: galleryStorage,
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'), false);
+    }
+  },
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB per image
+});
+
+// POST /api/gallery - Upload multiple gallery images
+app.post('/api/gallery', galleryUpload.array('images', 20), async (req, res) => {
+  try {
+    const token = req.headers['authorization']?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+    try { jwt.verify(token, JWT_SECRET); } catch (e) { return res.status(401).json({ error: 'Invalid token' }); }
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No images uploaded' });
+    }
+
+    const { title, description, status } = req.body;
+    const validStatus = status === 'active' || status === 'inactive' ? status : 'active';
+    const results = [];
+
+    // Get the current max display_order
+    const maxOrder = await db.get('SELECT MAX(display_order) as max_order FROM gallery_images');
+    let currentOrder = (maxOrder?.max_order || 0);
+
+    for (const file of req.files) {
+      currentOrder++;
+      const imagePath = `/uploads/gallery/${file.filename}`;
+      const result = await db.run(
+        `INSERT INTO gallery_images (title, description, image_path, display_order, status) VALUES (?, ?, ?, ?, ?)`,
+        [title || '', description || '', imagePath, currentOrder, validStatus]
+      );
+      results.push({
+        id: result.lastID,
+        title: title || '',
+        description: description || '',
+        image_path: imagePath,
+        display_order: currentOrder,
+        status: validStatus
+      });
+    }
+
+    res.status(201).json({ success: true, images: results });
+  } catch (error) {
+    console.error('Error uploading gallery images:', error);
+    res.status(500).json({ error: 'Failed to upload gallery images' });
+  }
+});
+
+// GET /api/gallery - Get all gallery images (public, only active)
+app.get('/api/gallery', async (req, res) => {
+  try {
+    const { status } = req.query;
+    let query = 'SELECT * FROM gallery_images';
+    let params = [];
+
+    if (status === 'all') {
+      query += ' ORDER BY display_order ASC, created_at DESC';
+    } else {
+      query += ' WHERE status = ? ORDER BY display_order ASC, created_at DESC';
+      params.push(status || 'active');
+    }
+
+    const images = await db.all(query, params);
+    res.json({ images });
+  } catch (error) {
+    console.error('Error fetching gallery images:', error);
+    res.status(500).json({ error: 'Failed to fetch gallery images' });
+  }
+});
+
+// GET /api/gallery/:id - Get a single gallery image
+app.get('/api/gallery/:id', async (req, res) => {
+  try {
+    const image = await db.get('SELECT * FROM gallery_images WHERE id = ?', [req.params.id]);
+    if (!image) return res.status(404).json({ error: 'Gallery image not found' });
+    res.json(image);
+  } catch (error) {
+    console.error('Error fetching gallery image:', error);
+    res.status(500).json({ error: 'Failed to fetch gallery image' });
+  }
+});
+
+// PUT /api/gallery/:id - Update gallery image details
+app.put('/api/gallery/:id', galleryUpload.single('image'), async (req, res) => {
+  try {
+    const token = req.headers['authorization']?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+    try { jwt.verify(token, JWT_SECRET); } catch (e) { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const { id } = req.params;
+    const existing = await db.get('SELECT * FROM gallery_images WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'Gallery image not found' });
+
+    const { title, description, status, display_order } = req.body;
+    let imagePath = existing.image_path;
+
+    if (req.file) {
+      // Delete old file
+      const oldPath = path.join(process.cwd(), existing.image_path);
+      if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+      imagePath = `/uploads/gallery/${req.file.filename}`;
+    }
+
+    await db.run(
+      `UPDATE gallery_images SET title = ?, description = ?, image_path = ?, display_order = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [
+        title !== undefined ? title : existing.title,
+        description !== undefined ? description : existing.description,
+        imagePath,
+        display_order !== undefined ? parseInt(display_order) : existing.display_order,
+        status || existing.status,
+        id
+      ]
+    );
+
+    const updated = await db.get('SELECT * FROM gallery_images WHERE id = ?', [id]);
+    res.json({ success: true, image: updated });
+  } catch (error) {
+    console.error('Error updating gallery image:', error);
+    res.status(500).json({ error: 'Failed to update gallery image' });
+  }
+});
+
+// DELETE /api/gallery/:id - Delete a gallery image
+app.delete('/api/gallery/:id', async (req, res) => {
+  try {
+    const token = req.headers['authorization']?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+    try { jwt.verify(token, JWT_SECRET); } catch (e) { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const { id } = req.params;
+    const existing = await db.get('SELECT * FROM gallery_images WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'Gallery image not found' });
+
+    // Delete the file from disk
+    const filePath = path.join(process.cwd(), existing.image_path);
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+
+    await db.run('DELETE FROM gallery_images WHERE id = ?', [id]);
+    res.json({ success: true, message: 'Gallery image deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting gallery image:', error);
+    res.status(500).json({ error: 'Failed to delete gallery image' });
+  }
+});
+
+// PUT /api/gallery/reorder - Reorder gallery images
+app.put('/api/gallery-reorder', async (req, res) => {
+  try {
+    const token = req.headers['authorization']?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+    try { jwt.verify(token, JWT_SECRET); } catch (e) { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const { orders } = req.body; // Array of { id, display_order }
+    if (!orders || !Array.isArray(orders)) {
+      return res.status(400).json({ error: 'Orders array is required' });
+    }
+
+    for (const item of orders) {
+      await db.run('UPDATE gallery_images SET display_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [item.display_order, item.id]);
+    }
+
+    res.json({ success: true, message: 'Gallery reordered successfully' });
+  } catch (error) {
+    console.error('Error reordering gallery:', error);
+    res.status(500).json({ error: 'Failed to reorder gallery' });
+  }
+});
+
+// =============================================
+// --- CMS Content CRUD API Endpoints ---
+// =============================================
+
+// GET /api/cms - Get all CMS content (optionally filtered by page)
+app.get('/api/cms', async (req, res) => {
+  try {
+    const { page_key } = req.query;
+    let query = 'SELECT * FROM cms_content';
+    let params = [];
+
+    if (page_key) {
+      query += ' WHERE page_key = ?';
+      params.push(page_key);
+    }
+
+    query += ' ORDER BY page_key, section_key, field_key';
+    const content = await db.all(query, params);
+
+    // Group by page > section > field
+    const grouped = {};
+    for (const item of content) {
+      if (!grouped[item.page_key]) grouped[item.page_key] = {};
+      if (!grouped[item.page_key][item.section_key]) grouped[item.page_key][item.section_key] = {};
+      grouped[item.page_key][item.section_key][item.field_key] = {
+        id: item.id,
+        value: item.field_value,
+        type: item.field_type
+      };
+    }
+
+    res.json({ content: grouped, raw: content });
+  } catch (error) {
+    console.error('Error fetching CMS content:', error);
+    res.status(500).json({ error: 'Failed to fetch CMS content' });
+  }
+});
+
+// GET /api/cms/:pageKey - Get CMS content for a specific page
+app.get('/api/cms/:pageKey', async (req, res) => {
+  try {
+    const { pageKey } = req.params;
+    const content = await db.all('SELECT * FROM cms_content WHERE page_key = ? ORDER BY section_key, field_key', [pageKey]);
+
+    const grouped = {};
+    for (const item of content) {
+      if (!grouped[item.section_key]) grouped[item.section_key] = {};
+      grouped[item.section_key][item.field_key] = {
+        id: item.id,
+        value: item.field_value,
+        type: item.field_type
+      };
+    }
+
+    res.json({ page_key: pageKey, content: grouped, raw: content });
+  } catch (error) {
+    console.error('Error fetching CMS page content:', error);
+    res.status(500).json({ error: 'Failed to fetch page content' });
+  }
+});
+
+// POST /api/cms - Create or update CMS content (upsert)
+app.post('/api/cms', async (req, res) => {
+  try {
+    const token = req.headers['authorization']?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+    try { jwt.verify(token, JWT_SECRET); } catch (e) { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const { page_key, section_key, field_key, field_value, field_type } = req.body;
+
+    if (!page_key || !section_key || !field_key) {
+      return res.status(400).json({ error: 'page_key, section_key, and field_key are required' });
+    }
+
+    const validType = ['text', 'textarea', 'html', 'image', 'number', 'json'].includes(field_type) ? field_type : 'text';
+
+    // Upsert: insert or replace
+    await db.run(
+      `INSERT INTO cms_content (page_key, section_key, field_key, field_value, field_type, updated_at)
+       VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(page_key, section_key, field_key)
+       DO UPDATE SET field_value = excluded.field_value, field_type = excluded.field_type, updated_at = CURRENT_TIMESTAMP`,
+      [page_key, section_key, field_key, field_value || '', validType]
+    );
+
+    const result = await db.get(
+      'SELECT * FROM cms_content WHERE page_key = ? AND section_key = ? AND field_key = ?',
+      [page_key, section_key, field_key]
+    );
+
+    res.json({ success: true, content: result });
+  } catch (error) {
+    console.error('Error saving CMS content:', error);
+    res.status(500).json({ error: 'Failed to save CMS content' });
+  }
+});
+
+// PUT /api/cms/bulk - Bulk update CMS content
+app.put('/api/cms/bulk', async (req, res) => {
+  try {
+    const token = req.headers['authorization']?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+    try { jwt.verify(token, JWT_SECRET); } catch (e) { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const { items } = req.body; // Array of { page_key, section_key, field_key, field_value, field_type }
+
+    if (!items || !Array.isArray(items)) {
+      return res.status(400).json({ error: 'Items array is required' });
+    }
+
+    for (const item of items) {
+      if (!item.page_key || !item.section_key || !item.field_key) continue;
+      const validType = ['text', 'textarea', 'html', 'image', 'number', 'json'].includes(item.field_type) ? item.field_type : 'text';
+
+      await db.run(
+        `INSERT INTO cms_content (page_key, section_key, field_key, field_value, field_type, updated_at)
+         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(page_key, section_key, field_key)
+         DO UPDATE SET field_value = excluded.field_value, field_type = excluded.field_type, updated_at = CURRENT_TIMESTAMP`,
+        [item.page_key, item.section_key, item.field_key, item.field_value || '', validType]
+      );
+    }
+
+    res.json({ success: true, message: `${items.length} CMS items updated` });
+  } catch (error) {
+    console.error('Error bulk updating CMS content:', error);
+    res.status(500).json({ error: 'Failed to bulk update CMS content' });
+  }
+});
+
+// DELETE /api/cms/:id - Delete a CMS content entry
+app.delete('/api/cms/:id', async (req, res) => {
+  try {
+    const token = req.headers['authorization']?.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Authentication required' });
+    try { jwt.verify(token, JWT_SECRET); } catch (e) { return res.status(401).json({ error: 'Invalid token' }); }
+
+    const { id } = req.params;
+    const existing = await db.get('SELECT * FROM cms_content WHERE id = ?', [id]);
+    if (!existing) return res.status(404).json({ error: 'CMS content not found' });
+
+    await db.run('DELETE FROM cms_content WHERE id = ?', [id]);
+    res.json({ success: true, message: 'CMS content deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting CMS content:', error);
+    res.status(500).json({ error: 'Failed to delete CMS content' });
+  }
+});
+
+// --- End Gallery & CMS API Endpoints ---
 
 
