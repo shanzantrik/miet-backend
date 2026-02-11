@@ -367,6 +367,22 @@ async function setupDatabase() {
     console.log('Migrated: Added consultation_price column to consultants table.');
   }
 
+  // --- MIGRATION: Add consultant subscription/pro/approval columns ---
+  const addConsultantCol = async (col, type) => {
+    if (!consultantCols.some(c => c.name === col)) {
+      await db.exec(`ALTER TABLE consultants ADD COLUMN ${col} ${type}`);
+      console.log(`Migrated: Added ${col} column to consultants table.`);
+    }
+  };
+  await addConsultantCol('is_pro', 'BOOLEAN DEFAULT 0');
+  await addConsultantCol('subscription_plan', 'TEXT');
+  await addConsultantCol('subscription_start', 'TEXT');
+  await addConsultantCol('subscription_end', 'TEXT');
+  await addConsultantCol('payment_id', 'TEXT');
+  await addConsultantCol('promoted_by_admin', 'BOOLEAN DEFAULT 0');
+  await addConsultantCol('approval_status', "TEXT DEFAULT 'approved'");
+  await addConsultantCol('approval_reason', 'TEXT');
+
   // Note: featured column is now included in the main CREATE TABLE statement
 
   // --- MIGRATION: Update products table schema if needed ---
@@ -1966,6 +1982,239 @@ app.get('/api/consultants/featured', async (req, res) => {
   });
   res.json(result);
 });
+// ============================================
+// CONSULTANT AUTH, SUBSCRIPTION & PROMOTION
+// (Must be BEFORE /api/consultants/:id routes)
+// ============================================
+
+// --- Consultant Registration (public) ---
+app.post('/api/consultants/register', upload.single('id_proof'), async (req, res) => {
+  try {
+    const { name, email, phone, password, speciality, city, description, tagline, id_proof_type } = req.body;
+
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Name, email, and password are required' });
+    }
+
+    // Check if consultant already exists
+    const existing = await db.get('SELECT * FROM consultants WHERE email = ?', email);
+    if (existing) {
+      return res.status(409).json({ error: 'A consultant with this email already exists' });
+    }
+
+    // Hash password
+    const password_hash = await bcrypt.hash(password, 10);
+
+    // Create user record
+    const userResult = await db.run(
+      'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+      email, password_hash, 'consultant'
+    );
+    const userId = userResult.lastID;
+
+    // Handle file upload
+    let id_proof_url = null;
+    if (req.file) {
+      id_proof_url = `/uploads/${req.file.filename}`;
+    }
+
+    // Create consultant profile with pending approval status
+    await db.run(
+      `INSERT INTO consultants (user_id, name, email, phone, description, tagline, speciality, city, id_proof_type, id_proof_url, status, featured, approval_status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'offline', 0, 'pending')`,
+      userId, name, email, phone || null, description || null, tagline || null,
+      speciality || null, city || null, id_proof_type || null, id_proof_url
+    );
+
+    res.status(201).json({
+      success: true,
+      message: 'Registration successful. Your profile is pending admin approval.'
+    });
+  } catch (error) {
+    console.error('Error registering consultant:', error);
+    if (error.code === 'SQLITE_CONSTRAINT') {
+      return res.status(409).json({ error: 'Email already registered' });
+    }
+    res.status(500).json({ error: 'Registration failed' });
+  }
+});
+
+// --- Consultant Login (email/password) ---
+app.post('/api/consultants/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const consultant = await db.get('SELECT * FROM consultants WHERE email = ?', email);
+    if (!consultant) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    if (consultant.approval_status === 'pending') {
+      return res.status(403).json({ error: 'Your profile is pending admin approval. Please wait for approval notification.' });
+    }
+    if (consultant.approval_status === 'rejected') {
+      return res.status(403).json({ error: 'Your profile has been rejected. Please contact support.' });
+    }
+
+    const user = await db.get('SELECT * FROM users WHERE id = ?', consultant.user_id);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, username: user.username, role: 'consultant', consultantId: consultant.id },
+      process.env.JWT_SECRET || 'miet_secret_key_2024',
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      token,
+      consultant: {
+        id: consultant.id,
+        name: consultant.name,
+        email: consultant.email,
+        speciality: consultant.speciality,
+        is_pro: consultant.is_pro || false,
+        subscription_plan: consultant.subscription_plan || null
+      }
+    });
+  } catch (error) {
+    console.error('Error logging in consultant:', error);
+    res.status(500).json({ error: 'Login failed' });
+  }
+});
+
+// --- Consultant Google OAuth ---
+app.get('/api/consultants/auth/google', (req, res) => {
+  try {
+    const scopes = [
+      'https://www.googleapis.com/auth/userinfo.email',
+      'https://www.googleapis.com/auth/userinfo.profile'
+    ];
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: scopes,
+      prompt: 'consent',
+      state: 'consultant_auth'
+    });
+    res.redirect(authUrl);
+  } catch (error) {
+    console.error('Error generating consultant Google OAuth URL:', error);
+    res.status(500).json({ error: 'Failed to initiate Google login' });
+  }
+});
+
+// --- Consultant Google OAuth Callback ---
+app.get('/api/consultants/auth/google/callback', async (req, res) => {
+  try {
+    const { code } = req.query;
+    if (!code) return res.status(400).json({ error: 'Authorization code is required' });
+
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+    const userInfo = await oauth2.userinfo.get();
+    const { email, name, picture } = userInfo.data;
+
+    let consultant = await db.get('SELECT * FROM consultants WHERE email = ?', email);
+
+    if (!consultant) {
+      const userResult = await db.run(
+        'INSERT OR IGNORE INTO users (username, password, role) VALUES (?, ?, ?)',
+        email, 'google_oauth_no_password', 'consultant'
+      );
+      const userId = userResult.lastID || (await db.get('SELECT id FROM users WHERE username = ?', email))?.id;
+
+      await db.run(
+        `INSERT INTO consultants (user_id, name, email, image, status, featured, approval_status)
+         VALUES (?, ?, ?, ?, 'offline', 0, 'approved')`,
+        userId, name || email.split('@')[0], email, picture || null
+      );
+      consultant = await db.get('SELECT * FROM consultants WHERE email = ?', email);
+    }
+
+    const token = jwt.sign(
+      { id: consultant.user_id, username: email, role: 'consultant', consultantId: consultant.id },
+      process.env.JWT_SECRET || 'miet_secret_key_2024',
+      { expiresIn: '7d' }
+    );
+
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    res.redirect(`${frontendUrl}/consultants/login?token=${token}&google_auth=true`);
+  } catch (error) {
+    console.error('Error in consultant Google OAuth callback:', error);
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    res.redirect(`${frontendUrl}/consultants/login?error=oauth_failed`);
+  }
+});
+
+// --- Get Consultant Subscription Status ---
+app.get('/api/consultants/subscription', authenticateToken, async (req, res) => {
+  try {
+    const consultant = await db.get('SELECT * FROM consultants WHERE user_id = ?', req.user.id);
+    if (!consultant) return res.status(404).json({ error: 'Consultant not found' });
+    res.json({
+      is_pro: consultant.is_pro || false,
+      subscription_plan: consultant.subscription_plan || null,
+      subscription_start: consultant.subscription_start || null,
+      subscription_end: consultant.subscription_end || null,
+      promoted_by_admin: consultant.promoted_by_admin || false
+    });
+  } catch (error) {
+    console.error('Error fetching subscription:', error);
+    res.status(500).json({ error: 'Failed to fetch subscription' });
+  }
+});
+
+// --- Subscribe to Plan (Consultant) ---
+app.post('/api/consultants/subscribe', authenticateToken, async (req, res) => {
+  try {
+    const { plan, billing_cycle, payment_id } = req.body;
+    if (!plan || !['basic', 'standard', 'premium'].includes(plan)) {
+      return res.status(400).json({ error: 'Invalid subscription plan' });
+    }
+    const consultant = await db.get('SELECT * FROM consultants WHERE user_id = ?', req.user.id);
+    if (!consultant) return res.status(404).json({ error: 'Consultant not found' });
+
+    const now = new Date();
+    const endDate = new Date(now);
+    if (billing_cycle === 'yearly') {
+      endDate.setFullYear(endDate.getFullYear() + 1);
+    } else {
+      endDate.setMonth(endDate.getMonth() + 1);
+    }
+    await db.run(
+      `UPDATE consultants SET is_pro = 1, subscription_plan = ?, subscription_start = ?, subscription_end = ?, payment_id = ? WHERE id = ?`,
+      plan, now.toISOString(), endDate.toISOString(), payment_id || null, consultant.id
+    );
+    res.json({ success: true, message: `Successfully subscribed to ${plan} plan`, subscription: { plan, start: now.toISOString(), end: endDate.toISOString(), is_pro: true } });
+  } catch (error) {
+    console.error('Error subscribing:', error);
+    res.status(500).json({ error: 'Subscription failed' });
+  }
+});
+
+// --- Get Pending Consultants (admin) ---
+app.get('/api/consultants/pending', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const pending = await db.all("SELECT * FROM consultants WHERE approval_status = 'pending' ORDER BY created_at DESC");
+    res.json(pending);
+  } catch (error) {
+    console.error('Error fetching pending consultants:', error);
+    res.status(500).json({ error: 'Failed to fetch pending consultants' });
+  }
+});
+
 // Get consultant by id (superadmin or self)
 app.get('/api/consultants/:id', authenticateToken, async (req, res) => {
   const { id } = req.params;
@@ -2074,6 +2323,54 @@ app.post('/api/consultants/:id/featured', authenticateToken, requireRole('supera
   await db.run('UPDATE consultants SET featured = ? WHERE id = ?', featured ? 1 : 0, id);
   res.json({ success: true });
 });
+
+// --- Admin: Approve/Reject Consultant ---
+app.post('/api/consultants/:id/approve', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, reason } = req.body;
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status. Use approved or rejected' });
+    }
+    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', id);
+    if (!consultant) return res.status(404).json({ error: 'Consultant not found' });
+    await db.run('UPDATE consultants SET approval_status = ?, approval_reason = ? WHERE id = ?', status, reason || null, id);
+    console.log(`Consultant ${consultant.name} (${consultant.email}) ${status}. Reason: ${reason || 'N/A'}`);
+    res.json({ success: true, message: `Consultant ${status} successfully` });
+  } catch (error) {
+    console.error('Error approving/rejecting consultant:', error);
+    res.status(500).json({ error: 'Failed to update approval status' });
+  }
+});
+
+// --- Admin: Promote Consultant to Pro ---
+app.post('/api/consultants/:id/promote', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { is_pro, subscription_plan } = req.body;
+    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', id);
+    if (!consultant) return res.status(404).json({ error: 'Consultant not found' });
+    if (is_pro) {
+      const now = new Date();
+      const endDate = new Date(now);
+      endDate.setFullYear(endDate.getFullYear() + 1);
+      await db.run(
+        `UPDATE consultants SET is_pro = 1, subscription_plan = ?, subscription_start = ?, subscription_end = ?, promoted_by_admin = 1 WHERE id = ?`,
+        subscription_plan || 'premium', now.toISOString(), endDate.toISOString(), id
+      );
+    } else {
+      await db.run(
+        `UPDATE consultants SET is_pro = 0, subscription_plan = NULL, subscription_start = NULL, subscription_end = NULL, promoted_by_admin = 0 WHERE id = ?`,
+        id
+      );
+    }
+    res.json({ success: true, message: is_pro ? 'Consultant promoted to Pro' : 'Consultant Pro status removed' });
+  } catch (error) {
+    console.error('Error promoting consultant:', error);
+    res.status(500).json({ error: 'Failed to update Pro status' });
+  }
+});
+
 // Consultant availability CRUD (consultant or superadmin)
 app.get('/api/consultants/:id/availability', async (req, res) => {
   const { id } = req.params;
