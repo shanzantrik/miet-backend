@@ -87,8 +87,27 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Handle preflight requests
-app.options('*', cors(corsOptions));
+// Handle preflight requests explicitly to ensure CORS headers are set
+app.options('*', (req, res) => {
+  const origin = req.headers.origin;
+  if (origin && (CORS_ORIGINS.includes(origin) || CORS_ORIGINS.includes('*'))) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+    res.header('Access-Control-Max-Age', '86400'); // 24 hours
+    return res.status(200).end();
+  } else if (!origin) {
+    // Allow requests without origin (like Postman, curl, etc.)
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+    return res.status(200).end();
+  }
+  // If origin is not allowed, still send CORS headers but with 403
+  res.header('Access-Control-Allow-Origin', origin || '*');
+  res.status(403).end();
+});
 
 // CORS headers are handled by the cors middleware above
 
@@ -1898,12 +1917,14 @@ function requireRole(role) {
 // Get all consultants (superadmin only) with optional city filter
 app.get('/api/consultants', authenticateToken, requireRole('superadmin'), async (req, res) => {
   const { city } = req.query;
-  let sql = 'SELECT * FROM consultants';
+  let sql = `SELECT c.*, u.username FROM consultants c
+             LEFT JOIN users u ON c.user_id = u.id`;
   let params = [];
   if (city) {
-    sql += ' WHERE city = ?';
+    sql += ' WHERE c.city = ?';
     params.push(city);
   }
+  sql += ' ORDER BY c.id';
   try {
     const consultants = await db.all(sql, params);
     res.json(consultants);
@@ -2268,6 +2289,23 @@ app.put('/api/consultants/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'superadmin' && req.user.id !== consultant.user_id) {
     return res.status(403).json({ error: 'Forbidden' });
   }
+
+  // Handle username/password updates if provided (superadmin only)
+  if (req.user.role === 'superadmin') {
+    if (req.body.username !== undefined && req.body.username !== null && req.body.username !== '') {
+      // Check if username already exists for another user
+      const existingUser = await db.get('SELECT id FROM users WHERE username = ? AND id != ?', req.body.username, consultant.user_id);
+      if (existingUser) {
+        return res.status(400).json({ error: 'Username already exists' });
+      }
+      await db.run('UPDATE users SET username = ? WHERE id = ?', req.body.username, consultant.user_id);
+    }
+    if (req.body.password !== undefined && req.body.password !== null && req.body.password !== '') {
+      const password_hash = await bcrypt.hash(req.body.password, 10);
+      await db.run('UPDATE users SET password = ? WHERE id = ?', password_hash, consultant.user_id);
+    }
+  }
+
   // Only update allowed fields
   const fields = [
     'name', 'email', 'phone', 'image', 'description', 'tagline', 'location_lat', 'location_lng', 'address', 'speciality', 'id_proof_type', 'id_proof_url', 'aadhar', 'bank_account', 'bank_ifsc', 'status', 'city', 'featured', 'consultation_price'
@@ -2288,9 +2326,11 @@ app.put('/api/consultants/:id', authenticateToken, async (req, res) => {
   }
   // Require city for update as well
   if (!req.body.city || String(req.body.city || '').trim() === '') return res.status(400).json({ error: 'City is required' });
-  if (updates.length === 0) return res.status(400).json({ error: 'No fields to update' });
-  values.push(id);
-  await db.run(`UPDATE consultants SET ${updates.join(', ')} WHERE id = ?`, ...values);
+  if (updates.length === 0 && (!req.body.username && !req.body.password)) return res.status(400).json({ error: 'No fields to update' });
+  if (updates.length > 0) {
+    values.push(id);
+    await db.run(`UPDATE consultants SET ${updates.join(', ')} WHERE id = ?`, ...values);
+  }
   res.json({ success: true });
 });
 // Delete consultant (superadmin only)
