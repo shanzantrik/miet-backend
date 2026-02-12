@@ -139,6 +139,61 @@ const razorpay = new Razorpay({
   key_secret: RAZORPAY_KEY_SECRET,
 });
 
+// --- File Upload Configuration ---
+// Ensure uploads directory exists and create organized subdirectories
+const uploadsDir = path.join(process.cwd(), 'uploads');
+const thumbnailsDir = path.join(uploadsDir, 'thumbnails');
+const pdfsDir = path.join(uploadsDir, 'pdfs');
+const iconsDir = path.join(uploadsDir, 'icons');
+const productImagesDir = path.join(uploadsDir, 'product_images');
+const instructorsDir = path.join(uploadsDir, 'instructors');
+const coursesDir = path.join(uploadsDir, 'courses');
+const blogsDir = path.join(uploadsDir, 'blogs');
+const galleryDir = path.join(uploadsDir, 'gallery');
+const teamDir = path.join(uploadsDir, 'team');
+const programmesDir = path.join(uploadsDir, 'programmes');
+
+// Create directories if they don't exist
+[uploadsDir, thumbnailsDir, pdfsDir, iconsDir, productImagesDir, instructorsDir, coursesDir, blogsDir, galleryDir, teamDir, programmesDir].forEach(dir => {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+});
+
+// Multer setup
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadsDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    let safeName = file.originalname
+      .toLowerCase()
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '') // Remove diacritics
+      .replace(/[^\x00-\x7F]/g, '') // Remove all non-ASCII characters
+      .replace(/\s+/g, '_') // Replace whitespace with _
+      .replace(/['"`]/g, '') // Remove apostrophes and quotes
+      .replace(/[^a-z0-9._-]/g, '_'); // Replace all other non-safe chars with _
+    cb(null, uniqueSuffix + '-' + safeName);
+  }
+});
+
+const upload = multer({ storage });
+
+// Serve uploads statically with organized directories
+app.use('/uploads/thumbnails', express.static(thumbnailsDir));
+app.use('/uploads/pdfs', express.static(pdfsDir));
+app.use('/uploads/icons', express.static(iconsDir));
+app.use('/uploads/product_images', express.static(productImagesDir));
+app.use('/uploads/instructors', express.static(instructorsDir));
+app.use('/uploads/courses', express.static(coursesDir));
+app.use('/uploads/blogs', express.static(blogsDir));
+app.use('/uploads/gallery', express.static(galleryDir));
+app.use('/uploads/team', express.static(teamDir));
+app.use('/uploads/programmes', express.static(programmesDir));
+app.use('/uploads', express.static(uploadsDir));
+
 const SMTP_HOST = process.env.SMTP_HOST || 'smtp.gmail.com';
 const SMTP_PORT = process.env.SMTP_PORT || 587;
 const SMTP_USER = process.env.SMTP_USER;
@@ -398,9 +453,19 @@ async function setupDatabase() {
 
   // --- MIGRATION: Add consultant subscription/pro/approval columns ---
   const addConsultantCol = async (col, type) => {
-    if (!consultantCols.some(c => c.name === col)) {
-      await db.exec(`ALTER TABLE consultants ADD COLUMN ${col} ${type}`);
-      console.log(`Migrated: Added ${col} column to consultants table.`);
+    try {
+      if (!consultantCols.some(c => c.name === col)) {
+        await db.exec(`ALTER TABLE consultants ADD COLUMN ${col} ${type}`);
+        console.log(`Migrated: Added ${col} column to consultants table.`);
+      }
+    } catch (error) {
+      if (error.message && error.message.includes('duplicate column')) {
+        console.log(`Column ${col} already exists (handled duplicate error).`);
+      } else {
+        // Re-throw other errors
+        console.error(`Error adding column ${col}:`, error);
+        throw error;
+      }
     }
   };
   await addConsultantCol('is_pro', 'BOOLEAN DEFAULT 0');
@@ -617,6 +682,48 @@ async function setupDatabase() {
     console.log('E-commerce tables ensured successfully.');
   } catch (error) {
     console.error('Error ensuring e-commerce tables:', error);
+  }
+
+
+  try {
+    // FORCE SCHEMA SYNC: We drop and recreate because previous versions had NOT NULL constraints
+    // that are now causing 500 errors when frontend field names differ slightly.
+    const teamCols = await db.all("PRAGMA table_info(team)");
+    const hasBio = teamCols.some(col => col.name === 'bio');
+    const hasNotNull = teamCols.some(col => col.notnull === 1 && col.name !== 'id');
+
+    if (hasNotNull || !hasBio) {
+      console.log('Recreating team table to fix schema/constraints...');
+      await db.run("DROP TABLE IF EXISTS team");
+    }
+    await ensureTeamTable();
+    console.log('Team table ensured successfully.');
+  } catch (error) {
+    console.error('Error ensuring team table:', error);
+  }
+
+  try {
+    const programmeCols = await db.all("PRAGMA table_info(programmes)");
+    const hasNotNull = programmeCols.some(col => col.notnull === 1 && col.name !== 'id');
+    if (hasNotNull) {
+      console.log('Recreating programmes table to fix constraints...');
+      await db.run("DROP TABLE IF EXISTS programmes");
+    }
+    await ensureProgrammesTable();
+    console.log('Programmes table ensured successfully.');
+  } catch (error) {
+    console.error('Error ensuring programmes table:', error);
+  }
+
+  // --- MIGRATION: Add bio column to team table if missing ---
+  try {
+    const teamCols = await db.all("PRAGMA table_info(team)");
+    if (teamCols.length > 0 && !teamCols.some(col => col.name === 'bio')) {
+      await db.exec("ALTER TABLE team ADD COLUMN bio TEXT");
+      console.log('Migrated: Added bio column to team table.');
+    }
+  } catch (err) {
+    console.error('Error migrating team table:', err);
   }
 
   // --- MIGRATION: Update users table to support 'users' role ---
@@ -946,14 +1053,7 @@ function generateWebinarId() {
   return `WEB-${Date.now()}-${Math.random().toString(36).substr(2, 9).toUpperCase()}`;
 }
 
-(async () => {
-  await setupDatabase();
-  if (INIT_DB) {
-    console.log('Database initialized.');
-    process.exit(0);
-  }
-  // ... existing code ...
-})();
+
 
 // Helper function to decode JWT without verification (for Supabase tokens)
 function decodeJwtPayload(token) {
@@ -5149,6 +5249,11 @@ app.listen(PORT, async () => {
   try {
     await setupDatabase();
     console.log('Database initialized.');
+
+    if (INIT_DB) {
+      console.log('Initialization complete. Exiting.');
+      process.exit(0);
+    }
   } catch (error) {
     console.error('Error initializing database:', error);
     // Don't exit - allow server to start even if DB init fails
@@ -5157,52 +5262,7 @@ app.listen(PORT, async () => {
   }
 });
 
-// Ensure uploads directory exists and create organized subdirectories
-const uploadsDir = path.join(process.cwd(), 'uploads');
-const thumbnailsDir = path.join(uploadsDir, 'thumbnails');
-const pdfsDir = path.join(uploadsDir, 'pdfs');
-const iconsDir = path.join(uploadsDir, 'icons');
-const productImagesDir = path.join(uploadsDir, 'product_images');
-const instructorsDir = path.join(uploadsDir, 'instructors');
-const coursesDir = path.join(uploadsDir, 'courses');
-const blogsDir = path.join(uploadsDir, 'blogs');
-const galleryDir = path.join(uploadsDir, 'gallery');
 
-// Create directories if they don't exist
-[uploadsDir, thumbnailsDir, pdfsDir, iconsDir, productImagesDir, instructorsDir, coursesDir, blogsDir, galleryDir].forEach(dir => {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-});
-// Multer setup
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, uploadsDir);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    let safeName = file.originalname
-      .toLowerCase()
-      .normalize('NFKD')
-      .replace(/[\u0300-\u036f]/g, '') // Remove diacritics
-      .replace(/[^\x00-\x7F]/g, '') // Remove all non-ASCII characters (including â¯)
-      .replace(/\s+/g, '_') // Replace whitespace with _
-      .replace(/['"`]/g, '') // Remove apostrophes and quotes
-      .replace(/[^a-z0-9._-]/g, '_'); // Replace all other non-safe chars with _
-    cb(null, uniqueSuffix + '-' + safeName);
-  }
-});
-const upload = multer({ storage });
-// Serve uploads statically with organized directories
-app.use('/uploads/thumbnails', express.static(thumbnailsDir));
-app.use('/uploads/pdfs', express.static(pdfsDir));
-app.use('/uploads/icons', express.static(iconsDir));
-app.use('/uploads/product_images', express.static(productImagesDir));
-app.use('/uploads/instructors', express.static(instructorsDir));
-app.use('/uploads/courses', express.static(coursesDir));
-app.use('/uploads/blogs', express.static(blogsDir));
-app.use('/uploads/gallery', express.static(galleryDir));
-app.use('/uploads', express.static(uploadsDir));
 // File upload endpoint
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
@@ -5734,6 +5794,67 @@ async function ensureCmsTable() {
     console.log('CMS content table ensured successfully.');
   } catch (error) {
     console.error('Error creating cms_content table:', error);
+    throw error;
+  }
+}
+
+// Ensure team table exists
+async function ensureTeamTable() {
+  try {
+    const tableExists = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='team'");
+    if (tableExists) {
+      // Add missing columns if they don't exist
+      const columns = await db.all("PRAGMA table_info(team)");
+      const columnNames = columns.map(col => col.name);
+      if (!columnNames.includes('created_at')) {
+        await db.run("ALTER TABLE team ADD COLUMN created_at DATETIME DEFAULT NULL");
+      }
+      return;
+    }
+
+    await db.run(`
+      CREATE TABLE team (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        designation TEXT,
+        bio TEXT,
+        image_url TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('Team table created successfully');
+  } catch (error) {
+    console.error('Error creating team table:', error);
+    throw error;
+  }
+}
+
+// Ensure programmes table exists
+async function ensureProgrammesTable() {
+  try {
+    const tableExists = await db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='programmes'");
+    if (tableExists) {
+      // Add missing columns if they don't exist
+      const columns = await db.all("PRAGMA table_info(programmes)");
+      const columnNames = columns.map(col => col.name);
+      if (!columnNames.includes('created_at')) {
+        await db.run("ALTER TABLE programmes ADD COLUMN created_at DATETIME DEFAULT NULL");
+      }
+      return;
+    }
+
+    await db.run(`
+      CREATE TABLE programmes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        description TEXT,
+        image_url TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('Programmes table created successfully');
+  } catch (error) {
+    console.error('Error creating programmes table:', error);
     throw error;
   }
 }
@@ -7714,6 +7835,283 @@ app.delete('/api/cms/:id', async (req, res) => {
   } catch (error) {
     console.error('Error deleting CMS content:', error);
     res.status(500).json({ error: 'Failed to delete CMS content' });
+  }
+});
+
+// --- Team & Programmes API Endpoints ---
+
+// Multer config for Team
+const teamStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    if (!fs.existsSync(teamDir)) {
+      fs.mkdirSync(teamDir, { recursive: true });
+    }
+    cb(null, teamDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    let safeName = file.originalname.toLowerCase().replace(/[^a-z0-9.]/g, '-');
+    cb(null, uniqueSuffix + '-' + safeName);
+  }
+});
+
+const teamUpload = multer({
+  storage: teamStorage,
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'), false);
+    }
+  },
+  limits: { fileSize: 5 * 1024 * 1024 }
+});
+
+// Multer config for Programmes
+const programmesStorage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    if (!fs.existsSync(programmesDir)) {
+      fs.mkdirSync(programmesDir, { recursive: true });
+    }
+    cb(null, programmesDir);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    let safeName = file.originalname.toLowerCase().replace(/[^a-z0-9.]/g, '-');
+    cb(null, uniqueSuffix + '-' + safeName);
+  }
+});
+
+const programmesUpload = multer({
+  storage: programmesStorage,
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only image files are allowed'), false);
+    }
+  },
+  limits: { fileSize: 5 * 1024 * 1024 }
+});
+
+// Validation middleware for Team
+const validateTeam = (req, res, next) => {
+  const { name, designation, bio } = req.body;
+  if (!name || !name.trim()) {
+    return res.status(400).json({ success: false, message: 'Name is required' });
+  }
+  if (!designation || !designation.trim()) {
+    return res.status(400).json({ success: false, message: 'Designation/Role is required' });
+  }
+  // Bio is optional but we'll trim it if present
+  next();
+};
+
+// Validation middleware for Programmes
+const validateProgrammes = (req, res, next) => {
+  const { title, description } = req.body;
+  if (!title || !title.trim()) {
+    return res.status(400).json({ success: false, message: 'Title is required' });
+  }
+  if (!description || !description.trim()) {
+    return res.status(400).json({ success: false, message: 'Description is required' });
+  }
+  next();
+};
+
+// --- Team Routes ---
+
+// GET /api/team - Get all team members (Public)
+app.get('/api/team', async (req, res) => {
+  try {
+    const team = await db.all('SELECT id, name as title, designation as role, bio as description, image_url, created_at FROM team ORDER BY created_at DESC');
+    res.json({ success: true, team });
+  } catch (error) {
+    console.error('Error fetching team:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch team members' });
+  }
+});
+
+// POST /api/team - Add team member
+app.post('/api/team', authenticateToken, requireRole('superadmin'), teamUpload.single('image'), async (req, res) => {
+  try {
+    const name = req.body.name || req.body.title || null;
+    const designation = req.body.designation || req.body.role || null;
+    const bio = req.body.bio || req.body.description || null;
+
+    const image_url = req.file ? `/uploads/team/${req.file.filename}` : (req.body.image_url || req.body.image || null);
+
+    if (!name) {
+      return res.status(400).json({ success: false, message: 'Name/Title is required' });
+    }
+
+    const result = await db.run(
+      'INSERT INTO team (name, designation, bio, image_url) VALUES (?, ?, ?, ?)',
+      [name, designation, bio, image_url]
+    );
+
+    res.status(201).json({
+      success: true,
+      id: result.lastID,
+      message: 'Team member added successfully'
+    });
+  } catch (error) {
+    console.error('Error adding team member:', error);
+    res.status(500).json({ success: false, message: 'Failed to add team member', error: error.message });
+  }
+});
+
+// PUT /api/team/:id - Update team member
+app.put('/api/team/:id', authenticateToken, requireRole('superadmin'), teamUpload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const name = req.body.name || req.body.title || null;
+    const designation = req.body.designation || req.body.role || null;
+    const bio = req.body.bio || req.body.description || null;
+
+    const image_url = req.file ? `/uploads/team/${req.file.filename}` : (req.body.image_url || req.body.image || null);
+
+    if (!name) {
+      return res.status(400).json({ success: false, message: 'Name/Title is required' });
+    }
+
+    const member = await db.get('SELECT * FROM team WHERE id = ?', [id]);
+    if (!member) {
+      return res.status(404).json({ success: false, message: 'Team member not found' });
+    }
+
+    // Use existing image if no new one provided
+    const final_image_url = image_url || member.image_url;
+
+    await db.run(
+      'UPDATE team SET name = ?, designation = ?, bio = ?, image_url = ? WHERE id = ?',
+      [name, designation, bio, final_image_url, id]
+    );
+
+    res.json({ success: true, message: 'Team member updated successfully' });
+  } catch (error) {
+    console.error('Error updating team member:', error);
+    res.status(500).json({ success: false, message: 'Failed to update team member', error: error.message });
+  }
+});
+
+// DELETE /api/team/:id - Delete team member (Admin only)
+app.delete('/api/team/:id', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const member = await db.get('SELECT * FROM team WHERE id = ?', [id]);
+
+    if (!member) {
+      return res.status(404).json({ success: false, message: 'Team member not found' });
+    }
+
+    if (member.image_url && member.image_url.startsWith('/uploads/team/')) {
+      const filePath = path.join(process.cwd(), member.image_url);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+
+    await db.run('DELETE FROM team WHERE id = ?', [id]);
+    res.json({ success: true, message: 'Team member deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting team member:', error);
+    res.status(500).json({ success: false, message: 'Failed to delete team member' });
+  }
+});
+
+// --- Programmes Routes ---
+
+// GET /api/programmes - Get all programmes (Public)
+app.get('/api/programmes', async (req, res) => {
+  try {
+    const programmes = await db.all('SELECT * FROM programmes ORDER BY created_at DESC');
+    res.json({ success: true, programmes });
+  } catch (error) {
+    console.error('Error fetching programmes:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch programmes' });
+  }
+});
+
+// POST /api/programmes - Add programme
+app.post('/api/programmes', authenticateToken, requireRole('superadmin'), programmesUpload.single('image'), async (req, res) => {
+  try {
+    const title = req.body.title || req.body.name || null;
+    const description = req.body.description || req.body.bio || null;
+
+    const image_url = req.file ? `/uploads/programmes/${req.file.filename}` : (req.body.image_url || req.body.image || null);
+
+    if (!title) {
+      return res.status(400).json({ success: false, message: 'Title is required' });
+    }
+
+    const result = await db.run(
+      'INSERT INTO programmes (title, description, image_url) VALUES (?, ?, ?)',
+      [title, description, image_url]
+    );
+
+    res.status(201).json({
+      success: true,
+      id: result.lastID,
+      message: 'Programme added successfully'
+    });
+  } catch (error) {
+    console.error('Error adding programme:', error);
+    res.status(500).json({ success: false, message: 'Failed to add programme', error: error.message });
+  }
+});
+
+// PUT /api/programmes/:id - Update programme
+app.put('/api/programmes/:id', authenticateToken, requireRole('superadmin'), programmesUpload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const title = req.body.title || req.body.name || null;
+    const description = req.body.description || req.body.bio || null;
+
+    const image_url = req.file ? `/uploads/programmes/${req.file.filename}` : (req.body.image_url || req.body.image || null);
+
+    if (!title) {
+      return res.status(400).json({ success: false, message: 'Title is required' });
+    }
+
+    const programme = await db.get('SELECT * FROM programmes WHERE id = ?', [id]);
+    if (!programme) {
+      return res.status(404).json({ success: false, message: 'Programme not found' });
+    }
+
+    // Use existing image if no new one provided
+    const final_image_url = image_url || programme.image_url;
+
+    await db.run(
+      'UPDATE programmes SET title = ?, description = ?, image_url = ? WHERE id = ?',
+      [title, description, final_image_url, id]
+    );
+
+    res.json({ success: true, message: 'Programme updated successfully' });
+  } catch (error) {
+    console.error('Error updating programme:', error);
+    res.status(500).json({ success: false, message: 'Failed to update programme', error: error.message });
+  }
+});
+
+// DELETE /api/programmes/:id - Delete programme (Admin only)
+app.delete('/api/programmes/:id', authenticateToken, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const programme = await db.get('SELECT * FROM programmes WHERE id = ?', [id]);
+
+    if (!programme) {
+      return res.status(404).json({ success: false, message: 'Programme not found' });
+    }
+
+    if (programme.image_url && programme.image_url.startsWith('/uploads/programmes/')) {
+      const filePath = path.join(process.cwd(), programme.image_url);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+
+    await db.run('DELETE FROM programmes WHERE id = ?', [id]);
+    res.json({ success: true, message: 'Programme deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting programme:', error);
+    res.status(500).json({ success: false, message: 'Failed to delete programme' });
   }
 });
 
