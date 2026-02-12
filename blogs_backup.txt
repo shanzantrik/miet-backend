@@ -1,7 +1,0 @@
-2|Blog with Thumbnail|This blog will have a thumbnail|Technology||Tech Author|2025-08-17 11:29:59|active
-3|Mental Health Awareness|Understanding mental health is crucial for overall wellbeing|Mental Health||Dr. Smith|2025-08-17 11:31:12|active
-4|Educational Therapy Techniques|Modern approaches to educational therapy|Education||Prof. Johnson|2025-08-17 11:31:23|active
-5|Updated Blog|Updated description|Technology||Updated Author|2025-08-17 11:36:02|inactive
-6|Blog with Status|Testing status field|Education||Status Tester|2025-08-17 11:35:44|inactive
-7|No Status Blog|Blog without status field|Support||Default Tester|2025-08-17 11:35:56|active
-8|Empty Status Test|Testing empty status|Therapy||Edge Tester|2025-08-17 11:36:26|active
