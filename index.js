@@ -89,24 +89,34 @@ app.use(cors(corsOptions));
 
 // Handle preflight requests explicitly to ensure CORS headers are set
 app.options('*', (req, res) => {
-  const origin = req.headers.origin;
-  if (origin && (CORS_ORIGINS.includes(origin) || CORS_ORIGINS.includes('*'))) {
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
-    res.header('Access-Control-Max-Age', '86400'); // 24 hours
-    return res.status(200).end();
-  } else if (!origin) {
-    // Allow requests without origin (like Postman, curl, etc.)
+  try {
+    const origin = req.headers.origin;
+    if (origin && CORS_ORIGINS.includes(origin)) {
+      res.header('Access-Control-Allow-Origin', origin);
+      res.header('Access-Control-Allow-Credentials', 'true');
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+      res.header('Access-Control-Max-Age', '86400'); // 24 hours
+      return res.status(200).end();
+    } else if (!origin) {
+      // Allow requests without origin (like Postman, curl, etc.)
+      res.header('Access-Control-Allow-Origin', '*');
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
+      return res.status(200).end();
+    } else {
+      // Origin not in allowed list - use cors middleware default behavior
+      // Don't set headers, let cors middleware handle it
+      return res.status(200).end();
+    }
+  } catch (err) {
+    console.error('Error in OPTIONS handler:', err);
+    // Fallback: allow the request
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept');
     return res.status(200).end();
   }
-  // If origin is not allowed, still send CORS headers but with 403
-  res.header('Access-Control-Allow-Origin', origin || '*');
-  res.status(403).end();
 });
 
 // CORS headers are handled by the cors middleware above
@@ -5120,6 +5130,19 @@ app.get('/api/consultants/:id/availability', async (req, res) => {
 
 // --- Start server ---
 const PORT = process.env.PORT || 4000;
+
+// Handle uncaught promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit, just log the error
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  // Don't exit immediately, let the server try to recover
+});
+
 app.listen(PORT, async () => {
   console.log(`Backend API running on http://localhost:${PORT}`);
 
@@ -5128,7 +5151,9 @@ app.listen(PORT, async () => {
     console.log('Database initialized.');
   } catch (error) {
     console.error('Error initializing database:', error);
-    process.exit(1);
+    // Don't exit - allow server to start even if DB init fails
+    // The database will be initialized on first request
+    console.warn('Server started but database initialization failed. Will retry on first request.');
   }
 });
 
