@@ -216,6 +216,7 @@ console.log('GOOGLE CLIENT ID 👉', process.env.GOOGLE_CLIENT_ID);
 console.log('Redirect URI being used:', GOOGLE_REDIRECT_URI);
 console.log('Please ensure this EXACT URL is added to your Google Cloud Console "Authorized redirect URIs"');
 console.log('---------------------------------');
+console.log('JWT Secret Loaded:', JWT_SECRET ? 'YES' : 'NO');
 
 // CORS configuration has been moved to the top of the file
 
@@ -2016,20 +2017,36 @@ function requireRole(role) {
 // --- Consultant CRUD API ---
 // Get all consultants (superadmin only) with optional city filter
 app.get('/api/consultants', authenticateToken, requireRole('superadmin'), async (req, res) => {
-  const { city } = req.query;
+  const { city, approval } = req.query;
+  console.log(`[DEBUG] Fetching consultants. Filters - City: ${city || 'None'}, Approval: ${approval || 'Any'}`);
+
   let sql = `SELECT c.*, u.username FROM consultants c
              LEFT JOIN users u ON c.user_id = u.id`;
   let params = [];
+  let conditions = [];
+
   if (city) {
-    sql += ' WHERE c.city = ?';
+    conditions.push('c.city = ?');
     params.push(city);
   }
+
+  if (approval) {
+    conditions.push('c.approval_status = ?');
+    params.push(approval);
+  }
+
+  if (conditions.length > 0) {
+    sql += ' WHERE ' + conditions.join(' AND ');
+  }
+
   sql += ' ORDER BY c.id';
+
   try {
     const consultants = await db.all(sql, params);
+    console.log(`[DEBUG] Found ${consultants.length} consultants`);
     res.json(consultants);
   } catch (err) {
-    console.error('Database error:', err);
+    console.error('[ERROR] Database error fetching consultants:', err);
     res.status(500).json({ error: 'Database error' });
   }
 });
@@ -2193,7 +2210,7 @@ app.post('/api/consultants/login', async (req, res) => {
 
     const token = jwt.sign(
       { id: user.id, username: user.username, role: 'consultant', consultantId: consultant.id },
-      process.env.JWT_SECRET || 'miet_secret_key_2024',
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -2266,7 +2283,7 @@ app.get('/api/consultants/auth/google/callback', async (req, res) => {
 
     const token = jwt.sign(
       { id: consultant.user_id, username: email, role: 'consultant', consultantId: consultant.id },
-      process.env.JWT_SECRET || 'miet_secret_key_2024',
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -2276,6 +2293,27 @@ app.get('/api/consultants/auth/google/callback', async (req, res) => {
     console.error('Error in consultant Google OAuth callback:', error);
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     res.redirect(`${frontendUrl}/consultants/login?error=oauth_failed`);
+  }
+});
+
+// --- Get Consultant Profile (Self) ---
+app.get('/api/consultants/profile', authenticateToken, async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'consultant') {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const consultantId = req.user.consultantId;
+    const consultant = await db.get('SELECT * FROM consultants WHERE id = ?', [consultantId]);
+
+    if (!consultant) {
+      return res.status(404).json({ error: 'Consultant not found' });
+    }
+
+    res.json({ consultant });
+  } catch (error) {
+    console.error('Consultant profile error:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
